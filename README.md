@@ -1,4 +1,4 @@
-# VW CDC Bluetooth Emulator (BT CONNECTION NOT TESTED YET, BUT COMMUNCATION BETWEEN ESP32 AND HU WORKS FINE)
+# VW CDC Bluetooth Emulator (WORK FINE)
 
 ESP32 firmware that emulates a VW CD Changer (CDC) to integrate a BT1036C Bluetooth module with VW RNS-MFD head units.
 
