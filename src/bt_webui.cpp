@@ -4,6 +4,8 @@
 #include <ElegantOTA.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+#include "vw_cdc.h"      // Для cdc_pause
+#include "bt1036_at.h"   // Для bt1036_pausePolling
 
 // ========== Debug mode ==========
 bool g_debugMode = false;
@@ -38,7 +40,7 @@ void btWebUI_log(const String &line, LogLevel level) {
     if ((level == LogLevel::DEBUG || level == LogLevel::VERBOSE) && !g_debugMode) {
         return;
     }
-    Serial.println(line);
+    // Serial.println(line); // Убрано для избежания помех
     if (level != LogLevel::VERBOSE) {
         logAppend(line);
     }
@@ -317,6 +319,11 @@ button{margin:2px;padding:6px 12px;background:#333;color:#fff;border:1px solid #
   <div class="log-box" id="log_bt" style="height:50vh;"></div>
 </section>
 <section>
+  <h3>Manual AT Command</h3>
+  <input type="text" id="at_cmd" placeholder="e.g., AT+VER" style="width: 200px;">
+  <button onclick="sendAt()" style="background:#036;">Send</button>
+</section>
+<section>
   <button onclick="toggleDebug()" id="debugBtn" style="background:#333;">Debug Mode: OFF</button>
 </section>
 <script>
@@ -330,6 +337,10 @@ ws.onmessage=function(ev){
     if(!paused)b.scrollTop=99999;
   }
 };
+function sendAt(){
+  var cmd=document.getElementById('at_cmd').value;
+  if(cmd){fetch('/api/at_cmd?cmd='+encodeURIComponent(cmd));}
+}
 function clr(){document.getElementById('log_bt').innerHTML="";}
 function togglePause(){
   paused=!paused;
@@ -740,6 +751,34 @@ void btWebUI_init() {
     
     webServer.on("/api/debug_status", []() {
         webServer.send(200, "text/plain", g_debugMode ? "ON" : "OFF");
+    });
+
+    webServer.on("/api/at_cmd", []() {
+        String cmd = webServer.arg("cmd");
+        if (cmd.length() > 0) {
+            btWebUI_log("[WEB] Manual command: " + cmd, LogLevel::INFO);
+            bt1036_sendRawCommand(cmd);
+            webServer.send(200, "text/plain", "OK");
+        } else {
+            webServer.send(400, "text/plain", "Bad Command");
+        }
+    });
+
+    // Настраиваем OTA callbacks для безопасного обновления
+    ElegantOTA.onStart([]() {
+        btWebUI_log("[OTA] Update started. Pausing peripherals.");
+        bt1036_pausePolling(true); // Останавливаем опросы BT-модуля
+        cdc_pause(true);           // Отключаем прерывания от магнитолы
+    });
+    ElegantOTA.onEnd([](bool success) {
+        btWebUI_log(String("[OTA] Update finished. Success: ") + success);
+        bt1036_pausePolling(false); // Возобновляем опросы BT-модуля
+        cdc_pause(false);           // Включаем прерывания обратно
+        if (!success) {
+            btWebUI_log("[OTA] Restarting ESP due to failed update.");
+            delay(1000);
+            ESP.restart();
+        }
     });
 
     ElegantOTA.begin(&webServer);

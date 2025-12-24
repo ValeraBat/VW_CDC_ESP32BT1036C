@@ -275,21 +275,9 @@ static void vw_scanCommandBytes() {
             case 0x38: break;  // CD confirm (игнор)
         }
         
-        // Debounce: игнорируем повторы той же кнопки в течение 300мс
-        // cppcheck-suppress variableScope  ; static needed to persist across calls
-        static CdcButton lastBtn = CdcButton::UNKNOWN;
-        // cppcheck-suppress variableScope  ; static needed to persist across calls
-        static uint32_t lastBtnTime = 0;
-        uint32_t now = millis();
-        
+        // Просто передаём кнопку дальше, без debounce. Логика будет в main.cpp
         if (g_btnCb && btn != CdcButton::UNKNOWN) {
-            if (btn != lastBtn || (now - lastBtnTime) > 300) {
-                lastBtn = btn;
-                lastBtnTime = now;
-                g_btnCb(btn);
-            } else if (g_debugMode) {
-                cdc_log("Button debounced: " + String((int)btn));
-            }
+            g_btnCb(btn);
         }
         
         // Advance scan pointer past this packet
@@ -717,3 +705,15 @@ void cdc_setScan(bool o) {
     updateModeBytes(); 
 }
 CdcStatus cdc_getStatus() { return g_status; }
+
+void cdc_pause(bool pause) {
+    if (g_dataOutPin < 0) return;
+
+    if (pause) {
+        detachInterrupt(digitalPinToInterrupt(g_dataOutPin));
+        cdc_log("VW DataOut ISR detached for OTA");
+    } else {
+        attachInterrupt(digitalPinToInterrupt(g_dataOutPin), vw_dataout_isr, CHANGE);
+        cdc_log("VW DataOut ISR re-attached after OTA");
+    }
+}

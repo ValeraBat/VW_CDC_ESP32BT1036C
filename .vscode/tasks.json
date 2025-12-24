@@ -79,6 +79,17 @@
 				"$gcc"
 			],
 			"group": "build"
+		},
+		{
+			"label": "PlatformIO: Build (esp32-s2-saola-1)",
+			"type": "shell",
+			"command": "C:/Users/ACERUS/.platformio/penv/Scripts/platformio.exe",
+			"args": [
+				"run",
+				"--environment",
+				"esp32-s2-saola-1"
+			],
+			"group": "build"
 		}
 	]
 }

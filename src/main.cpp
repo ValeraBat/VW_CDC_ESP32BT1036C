@@ -13,6 +13,7 @@
  *   CD4 = Enter Pairing Mode (TRACK 80)
  *   CD5 = Disconnect current device
  *   CD6 = Clear all paired devices
+ *   CD6 (double press) = Toggle WiFi ON/OFF
  *   SCAN = Hangup call
  *   MIX = Answer call
  *   <</>>	= Prev/Next track
@@ -21,9 +22,13 @@
  *   TRACK 80 = Waiting for BT connection
  *   TRACK 10 = Just connected (5 sec)
  *   TRACK 1+ = Normal playback with time from BT
+ *   TRACK 90 = WiFi OFF
+ *   TRACK 91 = WiFi ON
  */
 
 #include <Arduino.h>
+#include <esp_task_wdt.h>
+#include <Preferences.h> // Для сохранения состояния WiFi
 
 #include "vw_cdc.h"
 #include "bt1036_at.h"
@@ -42,6 +47,12 @@ static const int8_t  CDC_SS_PIN   = -1;  // Not used (single device)
 static const uint8_t CDC_NEC_PIN  =  4;  // VW DataOut ← Radio (button commands)
 
 // ============================================================================
+// WIFI STATE
+// ============================================================================
+static bool g_wifiEnabled = true;
+static Preferences g_prefs;
+
+// ============================================================================
 // GLOBAL STATE
 // ============================================================================
 static uint8_t g_currentDisc  = 1;   // Current CD number (always 1)
@@ -53,12 +64,13 @@ static bool g_isPlaying = false;     // Playback state for toggle logic
 static uint32_t g_scanResetTime = 0;
 static uint32_t g_mixResetTime = 0;
 
+// Button Debounce & Double Press state
+static CdcButton g_lastButton = CdcButton::UNKNOWN;
+static uint32_t  g_lastButtonTime = 0;
+static uint32_t  g_cd6PressTime = 0;   // Для отслеживания двойного нажатия CD6
+
 // ============================================================================
 // DISPLAY MODE STATE MACHINE
-// Shows BT connection status via track number on radio display:
-//   TRACK 80 = Waiting for BT connection (pairing mode)
-//   TRACK 10 = Device just connected (shown for 5 seconds)
-//   TRACK 1+ = Normal playback mode (time from BT module)
 // ============================================================================
 enum class DisplayMode {
     WAITING_FOR_BT,      // TRACK 80 - waiting for connection
@@ -75,6 +87,23 @@ static bool g_isPairingMode = false;                 // true = waiting for NEW d
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+/** Включение/выключение WiFi */
+static void toggleWiFi() {
+    g_wifiEnabled = !g_wifiEnabled;
+    g_prefs.begin("sys_config", false);
+    g_prefs.putBool("wifi_on", g_wifiEnabled);
+    g_prefs.end();
+    
+    String msg = String("[MAIN] WiFi turned ") + (g_wifiEnabled ? "ON" : "OFF") + ". Rebooting to apply...";
+    btWebUI_log(msg, LogLevel::INFO);
+    
+    // Показываем на дисплее статус
+    cdc_setDiscTrack(1, g_wifiEnabled ? 91 : 90); // 91 = WIFI ON, 90 = WIFI OFF
+    
+    delay(2000); // Даем время прочитать сообщение и увидеть на дисплее
+    ESP.restart();
+}
 
 /** Increment track number (1-99 wrap) */
 static void bumpTrackForward() {
@@ -95,7 +124,6 @@ static void toggleHfpMute() {
 
 // ============================================================================
 // BUTTON HANDLER
-// Called by CDC decoder when a button press is detected from the radio
 // ============================================================================
 
 /** Get button name for logging */
@@ -115,20 +143,39 @@ static const char* getButtonName(CdcButton btn) {
         case CdcButton::DISC_4:        return "CD4";
         case CdcButton::DISC_5:        return "CD5";
         case CdcButton::DISC_6:        return "CD6";
+        case CdcButton::DISC_6_DOUBLE_PRESS: return "CD6_DOUBLE_PRESS";
         case CdcButton::UNKNOWN:       return "UNKNOWN";
         default:                       return "???";
     }
 }
 
+// Новый обработчик с debounce и double-press логикой
 static void onCdcButton(CdcButton btn) {
+    uint32_t now = millis();
+    String logMsg;
+
+    // --- Debounce Filter ---
+    if (btn == g_lastButton && (now - g_lastButtonTime < 300)) {
+        return; 
+    }
+    g_lastButton = btn;
+    g_lastButtonTime = now;
+
+    // --- Double Press Logic for CD6 ---
+    if (btn == CdcButton::DISC_6) {
+        if (now - g_cd6PressTime < 500) {
+            g_cd6PressTime = 0; 
+            return onCdcButton(CdcButton::DISC_6_DOUBLE_PRESS);
+        } else {
+            g_cd6PressTime = now;
+            return;
+        }
+    }
+    
     const char* btnName = getButtonName(btn);
-    String logMsg;  // Для WebUI
 
     switch (btn) {
-
-        // ---- Треки ----
         case CdcButton::NEXT_TRACK:
-            // Переключаем на нормальный режим если ещё не там
             if (g_displayMode != DisplayMode::NORMAL_PLAYBACK) {
                 g_displayMode = DisplayMode::NORMAL_PLAYBACK;
                 g_currentTrack = 1;
@@ -140,18 +187,16 @@ static void onCdcButton(CdcButton btn) {
             break;
 
         case CdcButton::PREV_TRACK:
-            // Переключаем на нормальный режим если ещё не там
             if (g_displayMode != DisplayMode::NORMAL_PLAYBACK) {
                 g_displayMode = DisplayMode::NORMAL_PLAYBACK;
-                g_currentTrack = 2;  // Чтобы после bumpBackward было 1
+                g_currentTrack = 2;
             }
             bumpTrackBackward();
             cdc_setDiscTrack(g_currentDisc, g_currentTrack);
             bt1036_prevTrack();
-            logMsg = String("[BTN] ") + btnName + " → BT: Prev, Track " + String(g_currentTrack);
+            logMsg = String("[BTN ") + btnName + " → BT: Prev, Track " + String(g_currentTrack);
             break;
 
-        // ---- Стандартные кнопки (если магнитола их отправит) ----
         case CdcButton::PLAY_PAUSE:
             g_isPlaying = !g_isPlaying;
             if (g_isPlaying) {
@@ -173,14 +218,10 @@ static void onCdcButton(CdcButton btn) {
 
         case CdcButton::NEXT_DISC:
         case CdcButton::PREV_DISC:
-            // Магнитола не шлёт эти команды в CDC режиме
             logMsg = String("[BTN] ") + btnName + " → (ignored)";
             break;
 
-        // ---- КНОПКИ CD1..CD3 ПЕРЕНАЗНАЧЕНИЕ ----
-
         case CdcButton::DISC_1: {
-            // CD1 = Play/Pause toggle (локальный флаг, как CD3)
             g_isPlaying = !g_isPlaying;
             if (g_isPlaying) {
                 bt1036_play();
@@ -195,61 +236,52 @@ static void onCdcButton(CdcButton btn) {
         }
 
         case CdcButton::DISC_2:
-            // CD2 = Stop
             bt1036_stop();
             cdc_setPlayState(CdcPlayState::STOPPED);
             logMsg = String("[BTN] ") + btnName + " → BT: Stop";
             break;
 
         case CdcButton::DISC_3:
-            // CD3 = HFP mic mute toggle
             toggleHfpMute();
             logMsg = String("[BTN] ") + btnName + " → Mic Mute: " + (g_hfpMuted ? "ON" : "OFF");
             break;
 
-        // ---- CD4 = Режим сопряжения ----
         case CdcButton::DISC_4:
             bt1036_enterPairingMode();
             g_displayMode = DisplayMode::WAITING_FOR_BT;
-            g_isPairingMode = true;  // Ждём новое устройство
-            g_currentTrack = 80;  // Показываем TRACK 80
+            g_isPairingMode = true;
+            g_currentTrack = 80;
             cdc_setDiscTrack(g_currentDisc, g_currentTrack);
             logMsg = String("[BTN] ") + btnName + " → BT: Pairing Mode (TRACK 80)";
             break;
 
-        // ---- CD5 = Отключить текущее устройство ----
         case CdcButton::DISC_5:
             bt1036_disconnect();
             bt1036_hfpDisconnect();
             g_displayMode = DisplayMode::WAITING_FOR_BT;
-            g_currentTrack = 80;  // Показываем TRACK 80
+            g_currentTrack = 80;
             cdc_setDiscTrack(g_currentDisc, g_currentTrack);
             logMsg = String("[BTN] ") + btnName + " → BT: Disconnect";
             break;
 
-        // ---- CD6 = Очистить список устройств ----
         case CdcButton::DISC_6:
-            bt1036_clearPairedDevices();
-            g_displayMode = DisplayMode::WAITING_FOR_BT;
-            g_isPairingMode = true;  // Ждём новое устройство
-            g_currentTrack = 80;  // Показываем TRACK 80
-            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
-            logMsg = String("[BTN] ") + btnName + " → BT: Clear Paired Devices";
+            // Handled in loop() for delayed single press
             break;
-
-        // ---- SCAN = Hangup Call ----
+            
+        case CdcButton::DISC_6_DOUBLE_PRESS:
+            toggleWiFi();
+            logMsg = String("[BTN] ") + btnName + " → Toggle WiFi";
+            break;
+            
         case CdcButton::SCAN_TOGGLE:
             bt1036_hangupCall();
-            // Пульс: 0xD0 → через 500мс сброс в 0x00
             cdc_setScan(true);
             g_scanResetTime = millis() + 500;
             logMsg = String("[BTN] ") + btnName + " → HFP: Hangup";
             break;
 
-        // ---- MIX = Answer Call ----
         case CdcButton::RANDOM_TOGGLE:
             bt1036_answerCall();
-            // Пульс: 0x04 → через 500мс сброс в 0xFF
             cdc_setRandom(true);
             g_mixResetTime = millis() + 500;
             logMsg = String("[BTN] ") + btnName + " → HFP: Answer Call";
@@ -261,18 +293,26 @@ static void onCdcButton(CdcButton btn) {
             break;
     }
     
-    // Единый лог - в btWebUI_log (Serial + WebSocket)
-    btWebUI_log(logMsg, LogLevel::INFO);
+    if (logMsg.length() > 0) {
+        btWebUI_log(logMsg, LogLevel::INFO);
+    }
 }
 
 // ============================================================================
 // SETUP
 // ============================================================================
 void setup() {
-    Serial.begin(115200);
-    delay(200);
-    
-    // Логируем причину последней перезагрузки
+    esp_task_wdt_init(15, true); 
+    esp_task_wdt_add(NULL);
+
+    g_prefs.begin("sys_config", true);
+    g_wifiEnabled = g_prefs.getBool("wifi_on", true);
+    g_prefs.end();
+
+    if (g_wifiEnabled) {
+        btWebUI_init();
+    }
+
     esp_reset_reason_t reason = esp_reset_reason();
     const char* reasonStr = "Unknown";
     switch (reason) {
@@ -289,25 +329,19 @@ void setup() {
         default: break;
     }
     
-    // Serial.println здесь OK - btWebUI ещё не инициализирован
-    Serial.println();
-    Serial.print("[MAIN] Reset reason: "); Serial.println(reasonStr);
-    Serial.println("[MAIN] VW CDC + BT1036 emulator start");
+    btWebUI_log(String("[MAIN] Reset reason: ") + reasonStr, LogLevel::INFO);
+    btWebUI_log(String("[MAIN] WiFi is ") + (g_wifiEnabled ? "ENABLED" : "DISABLED"), LogLevel::INFO);
+    btWebUI_log("[MAIN] VW CDC + BT1036 emulator start", LogLevel::INFO);
 
-    // BT1036 - используем Serial2 для GPIO16/17 (модуль пока не подключен)
     bt1036_init(Serial2, BT_RX_PIN, BT_TX_PIN);
 
-    // CDC - начинаем с TRACK 80 (ожидание BT)
     g_currentTrack = 80;
     g_displayMode = DisplayMode::WAITING_FOR_BT;
-    cdc_setDiscTrack(g_currentDisc, g_currentTrack);  // TRACK 80 = ждём подключения
-    cdc_setPlayState(CdcPlayState::PLAYING);          // Принудительно PLAYING
+    cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+    cdc_setPlayState(CdcPlayState::PLAYING);
     cdc_setRandom(false);
     cdc_setScan(false);
-    cdc_init(CDC_SCK_PIN, CDC_MISO_PIN, CDC_MOSI_PIN, CDC_SS_PIN, CDC_NEC_PIN, onCdcButton);  // Потом инициализируем
-
-    // Web UI
-    btWebUI_init();
+    cdc_init(CDC_SCK_PIN, CDC_MISO_PIN, CDC_MOSI_PIN, CDC_SS_PIN, CDC_NEC_PIN, onCdcButton);
 
     btWebUI_log("[MAIN] Init complete.", LogLevel::INFO);
 }
@@ -316,35 +350,48 @@ void setup() {
 // MAIN LOOP
 // ============================================================================
 void loop() {
-    // Process all subsystems
+    esp_task_wdt_reset();
+
     bt1036_loop();
     cdc_loop();
-    btWebUI_loop();
+    if (g_wifiEnabled) {
+        btWebUI_loop();
+    }
     
-    // Reset SCAN indicator after 500ms pulse
+    if (g_cd6PressTime > 0 && (millis() - g_cd6PressTime >= 500)) {
+        g_cd6PressTime = 0; 
+        
+        // Теперь выполняем действие для ОДИНОЧНОГО нажатия CD6
+        bt1036_clearPairedDevices();
+        g_displayMode = DisplayMode::WAITING_FOR_BT;
+        g_isPairingMode = true;
+        g_currentTrack = 80;
+        cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+        btWebUI_log("[BTN] CD6 → BT: Clear Paired Devices", LogLevel::INFO);
+    }
+
     if (g_scanResetTime > 0 && millis() > g_scanResetTime) {
         g_scanResetTime = 0;
         cdc_setScan(false);
     }
     
-    // Reset MIX indicator after 500ms pulse
     if (g_mixResetTime > 0 && millis() > g_mixResetTime) {
         g_mixResetTime = 0;
         cdc_setRandom(false);
         cdc_resetModeFF();
     }
     
-    // ========== BT CONNECTION STATUS HANDLING ==========
     BTConnState currentBtState = bt1036_getState();
     
-    // Detect transition: DISCONNECTED -> CONNECTED
     if (g_lastBtState == BTConnState::DISCONNECTED && 
         (currentBtState == BTConnState::CONNECTED_IDLE || 
          currentBtState == BTConnState::PLAYING || 
          currentBtState == BTConnState::PAUSED)) {
         
+        bt1036_setVolume(15);
+        btWebUI_log("[MAIN] Set BT volume to MAX (15)", LogLevel::INFO);
+
         if (g_isPairingMode) {
-            // NEW device connected (after CD4/CD6) - show TRACK 10 for 5 sec
             g_displayMode = DisplayMode::JUST_CONNECTED;
             g_connectedShowTime = millis();
             g_currentTrack = 10;
@@ -352,7 +399,6 @@ void loop() {
             g_autoPlaySent = false;
             btWebUI_log("[MAIN] New device connected! Showing TRACK 10 for 5 sec", LogLevel::INFO);
         } else {
-            // AUTO-RECONNECT to known device - instant play
             g_displayMode = DisplayMode::NORMAL_PLAYBACK;
             g_currentTrack = 1;
             g_isPlaying = true;
@@ -367,7 +413,6 @@ void loop() {
         }
     }
     
-    // Detect DISCONNECTION
     if (currentBtState == BTConnState::DISCONNECTED && 
         g_lastBtState != BTConnState::DISCONNECTED) {
         g_displayMode = DisplayMode::WAITING_FOR_BT;
@@ -379,17 +424,15 @@ void loop() {
     
     g_lastBtState = currentBtState;
     
-    // Transition: JUST_CONNECTED -> NORMAL_PLAYBACK after 5 seconds
     if (g_displayMode == DisplayMode::JUST_CONNECTED) {
         if (millis() - g_connectedShowTime > 5000) {
             g_displayMode = DisplayMode::NORMAL_PLAYBACK;
             g_currentTrack = 1;
             g_isPlaying = true;
-            g_isPairingMode = false;  // Reset pairing mode flag
+            g_isPairingMode = false;
             cdc_setDiscTrack(g_currentDisc, g_currentTrack);
             btWebUI_log("[MAIN] Switching to normal playback mode (TRACK 1)", LogLevel::INFO);
             
-            // Send auto-play command
             if (!g_autoPlaySent) {
                 g_autoPlaySent = true;
                 bt1036_play();
@@ -399,7 +442,6 @@ void loop() {
         }
     }
     
-    // In normal playback mode, update time from BT module
     if (g_displayMode == DisplayMode::NORMAL_PLAYBACK) {
         TrackInfo ti = bt1036_getTrackInfo();
         if (ti.valid && ti.elapsedSec > 0) {

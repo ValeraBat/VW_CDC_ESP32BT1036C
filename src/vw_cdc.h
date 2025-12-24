@@ -37,6 +37,7 @@ enum class CdcButton {
     DISC_4,
     DISC_5,
     DISC_6,
+    DISC_6_DOUBLE_PRESS, // Новое событие для двойного нажатия CD6
     UNKNOWN
 };
 
@@ -85,3 +86,6 @@ void cdc_setPlayTime(uint8_t minutes, uint8_t seconds);
 
 // Получить текущее состояние
 CdcStatus cdc_getStatus();
+
+// Приостановить/возобновить обработку прерываний
+void cdc_pause(bool pause);

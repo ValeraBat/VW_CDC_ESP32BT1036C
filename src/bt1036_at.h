@@ -68,6 +68,7 @@ void bt1036_requestA2dpStat();   // AT+A2DPSTAT
 void bt1036_requestA2dpInfo();   // AT+A2DPINFO
 void bt1036_requestAvrcpStat();  // AT+AVRCPSTAT
 void bt1036_setAvrcpCfg(uint8_t cfg); // AT+AVRCPCFG=cfg (битовое поле)
+void bt1036_setVolume(uint8_t volume);      // AT+SPKVOL=vol,vol
 
 // ---- Runtime HFP (звонки) ----
 // команды по даташиту BT1036C (HFPxxx)
@@ -82,6 +83,7 @@ void bt1036_setMicMute(bool muteOn);      // AT+MICMUTE=0/1
 // ---- Runtime системные ----
 void bt1036_softReboot();                 // AT+REBOOT
 void bt1036_setBtEnabled(bool enabled);   // AT+BTEN=0/1
+void bt1036_sendRawCommand(const String& cmd); // Для ручного ввода команд
 
 // ---- Геттеры состояния ----
 BTConnState bt1036_getState();
@@ -115,6 +117,8 @@ void bt1036_setCod(const String &codHex6);    // AT+COD=XXXXXX (6 hex chars)
 void bt1036_getSep();                         // AT+SEP
 void bt1036_setSep(uint8_t hexVal);           // AT+SEP=0x01..0xFF (0..255)
 
+void bt1036_setI2sConfig(uint8_t cfg);        // AT+I2SCFG=cfg (битовое поле)
+
 // HFP-настройки (по даташиту)
 void bt1036_requestHfpStat();                 // AT+HFPSTAT
 void bt1036_setHfpSampleRate(uint32_t rate);  // AT+HFPSR=0/8000/16000/48000
@@ -124,6 +128,10 @@ void bt1036_setHfpConfig(uint8_t cfg);        // AT+HFPCFG=bitfield
 void bt1036_requestDevStat();                 // AT+DEVSTAT
 void bt1036_requestStat();                    // AT+STAT
 
+// Приостановка фонового опроса
+void bt1036_pausePolling(bool pause);
+
 // Одноразовая "фабричная" настройка модуля BT1036.
 // Вызывается вручную из CLI/Serial/WebUI один раз, дальше модуль хранит всё в своей NVM.
 void bt1036_runFactorySetup();
+

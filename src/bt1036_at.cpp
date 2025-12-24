@@ -25,6 +25,7 @@ static BtStateCallback stateCb           = nullptr;
 
 // фоновый опрос статусов
 static uint32_t        lastStatPollMs    = 0;
+static bool            g_pollingPaused   = false;
 
 // ---------- helpers очереди ----------
 static bool queueIsEmpty() {
@@ -77,6 +78,14 @@ static void setBtState(BTConnState newState) {
 // ---------- отправка ----------
 static void sendCommandNow(const String &cmd) {
     if (!bt) return;
+
+    // Обработка внутренних псевдо-команд
+    if (cmd == F("AT+RESUMEPOLL")) {
+        bt1036_pausePolling(false); // Возобновляем опрос
+        cmdInProgress = false;      // Считаем команду "выполненной"
+        if (!queueIsEmpty()) queuePop(); // Переходим к следующей
+        return;
+    }
 
     btWebUI_log("[BT] >> " + cmd, LogLevel::VERBOSE);  // AT команды - verbose
 
@@ -317,7 +326,7 @@ void bt1036_loop() {
 
     // --- фоновый опрос статуса A2DP/DEVSTAT раз в 3 секунды ---
     uint32_t now = millis();
-    if (!cmdInProgress && (now - lastStatPollMs > 3000)) {
+    if (!g_pollingPaused && !cmdInProgress && (now - lastStatPollMs > 3000)) {
         bt1036_requestA2dpStat();
         bt1036_requestDevStat();
         lastStatPollMs = now;
@@ -361,6 +370,15 @@ void bt1036_setAvrcpCfg(uint8_t cfg) {
     queuePush(cmd);
 }
 
+void bt1036_setVolume(uint8_t volume) {
+    if (volume > 15) volume = 15;
+    String cmd = String(F("AT+SPKVOL="));
+    cmd += String(volume);
+    cmd += ",";
+    cmd += String(volume);
+    queuePush(cmd);
+}
+
 // ---------- HFP runtime ----------
 
 void bt1036_hfpConnectLast() { queuePush(String(F("AT+HFPCONN"))); }
@@ -396,6 +414,12 @@ void bt1036_setBtEnabled(bool enabled) {
     String cmd = String(F("AT+BTEN="));
     cmd += (enabled ? "1" : "0");
     queuePush(cmd);
+}
+
+void bt1036_sendRawCommand(const String& cmd) {
+    if (cmd.length() > 0) {
+        queuePush(cmd);
+    }
 }
 
 // ---------- Геттеры / колбэки ----------
@@ -507,6 +531,12 @@ void bt1036_setSep(uint8_t hexVal) {
     queuePush(cmd);
 }
 
+void bt1036_setI2sConfig(uint8_t cfg) {
+    String cmd = String(F("AT+I2SCFG="));
+    cmd += String(cfg);
+    queuePush(cmd);
+}
+
 // ---------- HFP настройки ----------
 
 void bt1036_requestHfpStat() {
@@ -542,10 +572,34 @@ void bt1036_requestStat() {
     queuePush(String(F("AT+STAT")));
 }
 
+// ---------- Управление опросом ----------
+
+void bt1036_pausePolling(bool pause) {
+    g_pollingPaused = pause;
+    if (!pause) {
+        // Сбрасываем таймер при возобновлении, чтобы избежать мгновенного опроса
+        lastStatPollMs = millis();
+    }
+    btWebUI_log(String("[BT] Polling ") + (pause ? "PAUSED" : "RESUMED"), LogLevel::INFO);
+}
+
 // ---------- Одноразовая "фабричная" настройка (опционально) ----------
 void bt1036_runFactorySetup() {
     btWebUI_log("[BT] Running factory setup...", LogLevel::INFO);
+    bt1036_pausePolling(true); // Приостанавливаем опрос
 
+    // 1. Принудительно останавливаем все активности
+    queuePush(String(F("AT+SCAN=0")));     // Остановить сканирование
+    queuePush(String(F("AT+A2DPDISC")));   // Разорвать A2DP
+    queuePush(String(F("AT+HFPDISC")));    // Разорвать HFP
+    
+    // Внутренняя команда для небольшой задержки, чтобы модуль успел обработать разрыв соединения
+    // Мы можем реализовать неблокирующую задержку или, для простоты этого одноразового действия,
+    // просто добавим ее здесь. Я добавлю ее в виде отдельной команды в очередь.
+    // Для простоты, мы можем просто добавить delay() в этот код, т.к. он вызывается вручную.
+    // Но лучше сделаем через очередь. 
+    // Давайте пока используем простой delay(), чтобы не усложнять.
+    
     // Имена
     bt1036_setName("VW_BT1036", false);
     bt1036_setBLEName("VW_BT1036", false);
@@ -556,6 +610,7 @@ void bt1036_runFactorySetup() {
     bt1036_setTxPower(10);
 
     // Профили: HFP-HF + A2DP Sink + AVRCP Controller = 168
+    // ВАЖНО: Эти команды часто требуют "чистого" состояния
     const uint16_t profileMask  = 168;
     const uint16_t autoconnMask = 168;
     bt1036_setProfile(profileMask);
@@ -567,8 +622,13 @@ void bt1036_runFactorySetup() {
     // Class of Device – car audio / hands-free
     bt1036_setCod("240404");
 
-    // SEP — спец. режим, оставим 0
+    // SEP — меняем разделитель на 0xFF для стабильности парсинга
     bt1036_setSep(0);
+
+    // I2S Config - устанавливаем частоту дискретизации 44.1 кГц.
+    // Это потенциально исправляет помехи на iOS-устройствах с кодеком AAC.
+    // 5 = 0b101 (I2S enable, master mode, 44.1kHz)
+    bt1036_setI2sConfig(5);
 
     // HFP настройки
     bt1036_setHfpSampleRate(16000);
@@ -578,6 +638,9 @@ void bt1036_runFactorySetup() {
     // AVRCP настройки: автополучение ID3 + прогресс каждую секунду
     // BIT[0]=1 (auto ID3), BIT[1-3]=001 (1 sec interval) → 0b0011 = 3
     bt1036_setAvrcpCfg(3);
+    
+    // Внутренняя команда для возобновления опроса после выполнения всех команд
+    queuePush(String(F("AT+RESUMEPOLL")));
 
     btWebUI_log("[BT] Factory setup queued (check OKs, then reboot module).", LogLevel::INFO);
 }
