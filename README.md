@@ -1,15 +1,16 @@
 # VW CDC Bluetooth Emulator
 
-ESP32 firmware that emulates a VW CD Changer (CDC) to integrate a BT1036C Bluetooth module with VW RNS-MFD head units.
+ESP32 firmware that emulates a VW CD Changer (CDC) to integrate a BT1036C Bluetooth module with VW RNS-MFD head units. This version uses a real-time operating system (FreeRTOS) for maximum stability and responsiveness.
 
 ## Features
 
 - **A2DP Audio Streaming** - Play music from phone via Bluetooth
 - **AVRCP Controls** - Track skip, play/pause from radio buttons
 - **HFP Hands-Free** - Answer/hangup calls, mic mute
-- **Auto-Play** - Automatic playback on reconnection
+- **RTOS-based Architecture** - High stability and responsiveness by running CDC, Bluetooth, and Web UI in parallel tasks.
+- **Safe OTA Updates** - Peripherals are paused during firmware updates to prevent crashes.
 - **Status Display** - BT connection status via track number
-- **Web UI** - WiFi configuration, live logs, OTA updates
+- **Web UI** - WiFi configuration, live logs, manual AT command console, and OTA updates.
 
 ## Hardware
 
@@ -41,6 +42,7 @@ Radio CD buttons are remapped to Bluetooth functions:
 | **CD4** | Enter Pairing Mode |
 | **CD5** | Disconnect device |
 | **CD6** | Clear paired devices |
+| **CD6 (Double Press)** | Toggle WiFi & Reboot |
 | **SCAN** | Hangup call |
 | **MIX** | Answer call |
 | **◀◀ / ▶▶** | Previous/Next track |
@@ -53,12 +55,9 @@ The track number on radio display indicates BT status:
 |-------|--------|
 | **80** | Waiting for BT connection |
 | **10** | Device just connected (5 sec) |
+| **90** | WiFi is OFF |
+| **91** | WiFi is ON |
 | **1+** | Normal playback mode |
-
-## Auto-Play Behavior
-
-- **Known device (auto-reconnect)**: Instant playback
-- **New device (after CD4/CD6)**: 5 second delay, then playback
 
 ## Web Interface
 
@@ -72,11 +71,21 @@ Connect to WiFi AP or use mDNS:
 ### Pages
 
 - `/` - Main control panel
-- `/bt` - Bluetooth debug logs
+- `/bt` - Bluetooth debug logs & **Manual AT Command Console**
 - `/cdc` - CDC protocol debug
 - `/logs` - All logs combined
 - `/wifi` - WiFi configuration
 - `/update` - OTA firmware update
+
+## Architecture (FreeRTOS)
+
+The firmware is built on the FreeRTOS real-time operating system to ensure that time-critical operations are never blocked. The logic is split into three main tasks:
+
+1.  **`cdc_task` (High Priority):** Manages all SPI communication with the head unit. Its high priority guarantees that the radio always receives responses in time, preventing "No CD Changer" errors.
+2.  **`bt_task` (Medium Priority):** Handles the AT command queue and communication with the BT1036 module.
+3.  **`webui_task` (Low Priority):** Serves the web interface and handles WebSocket communication. Its low priority ensures that user interface activity can never interfere with the core functionality.
+
+Button presses from the head unit are safely passed from the ISR (Interrupt Service Routine) to the main logic loop via a thread-safe queue.
 
 ## Build & Upload
 
@@ -95,50 +104,12 @@ pio device monitor
 
 ```
 src/
-├── main.cpp        # Entry point, button mapping, state machine
+├── main.cpp        # Entry point, RTOS tasks, button mapping, state machine
 ├── bt1036_at.cpp/h # BT1036C driver (AT command queue)
 ├── vw_cdc.cpp/h    # CDC emulator + button decoder
 └── bt_webui.cpp/h  # Web UI, WebSocket, OTA
 ```
-
-## Protocol Details
-
-### CDC → Radio (SPI)
-- 8-byte packets at 62.5kHz
-- Track/time in BCD format
-- State machine: IDLE → INIT → LEAD_IN → PLAY
-
-### Radio → CDC (DataOut)
-- Pulse-width encoded commands
-- 32-bit packets: `[0x53] [0x2C] [cmd] [~cmd]`
-- Start pulse: ~4.5ms LOW
-- Bit '0': ~560µs LOW, Bit '1': ~1680µs LOW
-
-## Button Codes (VW RNS-MFD)
-
-| Button | Code |
-|--------|------|
-| CD1 | 0x0C |
-| CD2 | 0x8C |
-| CD3 | 0x4C |
-| CD4 | 0xCC |
-| CD5 | 0x2C |
-| CD6 | 0xAC |
-| NEXT | 0xF8 |
-| PREV | 0x78 |
-| SCAN | 0xA0 |
-| MIX | 0xE0 |
-
-## Factory Setup
-
-Run once via Web UI (Main → System → Factory Setup):
-1. Sets device name: `VW_BT1036`
-2. Configures COD: `240404` (car audio)
-3. Enables profiles: A2DP + AVRCP + HFP
-4. Configures HFP: 16kHz, echo cancel, auto-reconnect
-
-**Reboot BT1036 after factory setup to persist changes.**
-
 ## License
 
 MIT License
+
