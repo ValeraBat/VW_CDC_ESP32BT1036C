@@ -299,6 +299,16 @@ static inline uint8_t fromBCD(uint8_t bcd) {
     return ((bcd >> 4) * 10) + (bcd & 0x0F);
 }
 
+static void cdc_sendSpiPacket(const uint8_t frame[8]) {
+    g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
+    for (int i = 0; i < 8; ++i) {
+        g_spi->transfer(frame[i]);
+        delayMicroseconds(874);
+    }
+    g_spi->endTransaction();
+}
+
+
 static void cdc_sendPackage(const uint8_t frame[8]) {
     // Логируем ВСЕ отправляемые пакеты для диагностики
     String hex = "SPI TX: ";
@@ -447,12 +457,7 @@ void cdc_loop() {
                 cdc_log(hex);
             }
             
-            g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-            for (int i = 0; i < 8; ++i) {
-                g_spi->transfer(idle[i]);
-                delayMicroseconds(874);
-            }
-            g_spi->endTransaction();
+            cdc_sendSpiPacket(idle);
             
             stateCounter++;
             if (stateCounter >= 0) {  // incfsz BIDIcount, f → goto StateIdle (then call SetStateInitPlay)
@@ -493,12 +498,7 @@ void cdc_loop() {
                     cdc_log(hex);
                 }
                 
-                g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-                for (int i = 0; i < 8; ++i) {
-                    g_spi->transfer(frame[i]);
-                    delayMicroseconds(874);
-                }
-                g_spi->endTransaction();
+                cdc_sendSpiPacket(frame);
                 
                 // Cycle discload: 0x29 → reached CD6? → 0x2E : decf discload
                 if (g_discLoad == 0x29) {
@@ -527,12 +527,7 @@ void cdc_loop() {
                     cdc_log(hex);
                 }
                 
-                g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-                for (int i = 0; i < 8; ++i) {
-                    g_spi->transfer(frame[i]);
-                    delayMicroseconds(874);
-                }
-                g_spi->endTransaction();
+                cdc_sendSpiPacket(frame);
             }
             
             stateCounter++;
@@ -562,12 +557,7 @@ void cdc_loop() {
                     0x3C
                 };
                 
-                g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-                for (int i = 0; i < 8; ++i) {
-                    g_spi->transfer(frame[i]);
-                    delayMicroseconds(874);
-                }
-                g_spi->endTransaction();
+                cdc_sendSpiPacket(frame);
             }
             else {
                 // Normal: 34 BE FE FF FF FF AE 3C
@@ -580,12 +570,7 @@ void cdc_loop() {
                     0x3C
                 };
                 
-                g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-                for (int i = 0; i < 8; ++i) {
-                    g_spi->transfer(frame[i]);
-                    delayMicroseconds(874);
-                }
-                g_spi->endTransaction();
+                cdc_sendSpiPacket(frame);
             }
             
             stateCounter++;
@@ -635,12 +620,7 @@ void cdc_loop() {
                 }
             }
             
-            g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-            for (int i = 0; i < 8; ++i) {
-                g_spi->transfer(frame[i]);
-                delayMicroseconds(874);
-            }
-            g_spi->endTransaction();
+            cdc_sendSpiPacket(frame);
         }
     }
 }

@@ -6,7 +6,8 @@ static HardwareSerial *bt = nullptr;
 
 // ---------- очередь команд ----------
 static const size_t   CMD_QUEUE_SIZE    = 10;
-static String         cmdQueue[CMD_QUEUE_SIZE];
+static const size_t   CMD_MAX_LEN       = 48;
+static char           cmdQueue[CMD_QUEUE_SIZE][CMD_MAX_LEN];
 static uint8_t        queueHead         = 0;
 static uint8_t        queueTail         = 0;
 static bool           cmdInProgress     = false;
@@ -41,12 +42,13 @@ static void queuePush(const String &cmd) {
         btWebUI_log("[BT] queue FULL, drop: " + cmd, LogLevel::INFO);
         return;
     }
-    cmdQueue[queueTail] = cmd;
+    strncpy(cmdQueue[queueTail], cmd.c_str(), CMD_MAX_LEN - 1);
+    cmdQueue[queueTail][CMD_MAX_LEN - 1] = '\0'; // Ensure null-termination
     queueTail = (queueTail + 1) % CMD_QUEUE_SIZE;
 }
 
-static String queueFront() {
-    if (queueIsEmpty()) return String();
+static const char* queueFront() {
+    if (queueIsEmpty()) return "";
     return cmdQueue[queueHead];
 }
 
@@ -76,18 +78,18 @@ static void setBtState(BTConnState newState) {
 }
 
 // ---------- отправка ----------
-static void sendCommandNow(const String &cmd) {
-    if (!bt) return;
+static void sendCommandNow(const char* cmd) {
+    if (!bt || !cmd || cmd[0] == '\0') return;
 
     // Обработка внутренних псевдо-команд
-    if (cmd == F("AT+RESUMEPOLL")) {
+    if (strcmp(cmd, "AT+RESUMEPOLL") == 0) {
         bt1036_pausePolling(false); // Возобновляем опрос
         cmdInProgress = false;      // Считаем команду "выполненной"
         if (!queueIsEmpty()) queuePop(); // Переходим к следующей
         return;
     }
 
-    btWebUI_log("[BT] >> " + cmd, LogLevel::VERBOSE);  // AT команды - verbose
+    btWebUI_log(String("[BT] >> ") + cmd, LogLevel::VERBOSE);  // AT команды - verbose
 
     bt->print(cmd);
     bt->print("\r\n");
@@ -135,8 +137,8 @@ static void handleLine(const String &lineIn) {
 
     if (line.startsWith(F("ERROR")) || line.startsWith(F("ERR"))) {
         if (cmdInProgress) {
-            String cur = queueFront();
-            btWebUI_log("[BT] CMD ERROR for: " + cur, LogLevel::INFO);
+            const char* cur = queueFront();
+            btWebUI_log(String("[BT] CMD ERROR for: ") + cur, LogLevel::INFO);
             cmdInProgress = false;
             if (!queueIsEmpty()) queuePop();
         }
@@ -223,8 +225,8 @@ static void handleLine(const String &lineIn) {
             uint8_t elMin = g_trackInfo.elapsedSec / 60;
             uint8_t elSec = g_trackInfo.elapsedSec % 60;
             
-            // Обновляем время на дисплее магнитолы!
-            cdc_setPlayTime(elMin, elSec);
+            // Время на дисплее теперь обновляется в главном цикле (main.cpp)
+            // cdc_setPlayTime(elMin, elSec);
             
             // Логируем красиво (не каждую секунду, чтобы не спамить)
             static uint32_t lastLogTime = 0;
@@ -311,9 +313,9 @@ void bt1036_loop() {
 
     // таймаут команды
     if (cmdInProgress && (millis() - cmdTimestamp > CMD_TIMEOUT_MS)) {
-        String cur = queueFront();
-        if (cur.length()) {
-            btWebUI_log("[BT] CMD TIMEOUT for: " + cur, LogLevel::INFO);
+        const char* cur = queueFront();
+        if (cur && cur[0] != '\0') {
+            btWebUI_log(String("[BT] CMD TIMEOUT for: ") + cur, LogLevel::INFO);
         }
         cmdInProgress = false;
         if (!queueIsEmpty()) queuePop();

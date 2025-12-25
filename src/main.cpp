@@ -29,10 +29,37 @@
 #include <Arduino.h>
 #include <esp_task_wdt.h>
 #include <Preferences.h> // Для сохранения состояния WiFi
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include "vw_cdc.h"
 #include "bt1036_at.h"
 #include "bt_webui.h"
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+const uint32_t DEBOUNCE_MS = 300;
+const uint32_t DOUBLE_PRESS_WINDOW_MS = 500;
+const uint32_t MUTEX_WAIT_MS = 100;
+
+// Track numbers used for status display
+struct DisplayTracks {
+    static const uint8_t WAITING_FOR_BT = 80;
+    static const uint8_t JUST_CONNECTED = 10;
+    static const uint8_t WIFI_OFF = 90;
+    static const uint8_t WIFI_ON = 91;
+};
+
+// FreeRTOS Task settings
+const uint32_t CDC_TASK_STACK_SIZE = 4096;
+const uint32_t BT_TASK_STACK_SIZE = 4096;
+const uint32_t WEBUI_TASK_STACK_SIZE = 4096;
+const UBaseType_t CDC_TASK_PRIORITY = 3;   // Highest priority for real-time SPI
+const UBaseType_t BT_TASK_PRIORITY = 2;    // Medium priority for BT commands
+const UBaseType_t WEBUI_TASK_PRIORITY = 1; // Lowest priority for Web UI
 
 // ============================================================================
 // PIN CONFIGURATION (ESP-WROVER-KIT / ESP32)
@@ -51,6 +78,9 @@ static const uint8_t CDC_NEC_PIN  =  4;  // VW DataOut ← Radio (button command
 // ============================================================================
 static bool g_wifiEnabled = true;
 static Preferences g_prefs;
+static QueueHandle_t g_buttonQueue = NULL; // Очередь для нажатий кнопок
+static SemaphoreHandle_t g_cdcMutex = NULL;      // Мьютекс для CDC
+static SemaphoreHandle_t g_btMutex = NULL;       // Мьютекс для BT
 
 // ============================================================================
 // GLOBAL STATE
@@ -99,7 +129,10 @@ static void toggleWiFi() {
     btWebUI_log(msg, LogLevel::INFO);
     
     // Показываем на дисплее статус
-    cdc_setDiscTrack(1, g_wifiEnabled ? 91 : 90); // 91 = WIFI ON, 90 = WIFI OFF
+    if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+        cdc_setDiscTrack(1, g_wifiEnabled ? DisplayTracks::WIFI_ON : DisplayTracks::WIFI_OFF);
+        xSemaphoreGive(g_cdcMutex);
+    }
     
     delay(2000); // Даем время прочитать сообщение и увидеть на дисплее
     ESP.restart();
@@ -118,7 +151,10 @@ static void bumpTrackBackward() {
 /** Toggle HFP microphone mute */
 static void toggleHfpMute() {
     g_hfpMuted = !g_hfpMuted;
-    bt1036_setMicMute(g_hfpMuted);
+    if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        bt1036_setMicMute(g_hfpMuted);
+        xSemaphoreGive(g_btMutex);
+    }
     btWebUI_log(String("[MAIN] HFP mic mute: ") + (g_hfpMuted ? "ON" : "OFF"), LogLevel::INFO);
 }
 
@@ -149,13 +185,23 @@ static const char* getButtonName(CdcButton btn) {
     }
 }
 
-// Новый обработчик с debounce и double-press логикой
+/**
+ * @brief Обработчик нажатия кнопки, ВЫЗЫВАЕМЫЙ ИЗ ПРЕРЫВАНИЯ (ISR).
+ * Должен быть максимально быстрым. Просто кладет кнопку в очередь.
+ */
 static void onCdcButton(CdcButton btn) {
+    xQueueSendFromISR(g_buttonQueue, &btn, NULL);
+}
+
+/**
+ * @brief ОСНОВНАЯ логика обработки кнопок. Вызывается из главного цикла.
+ */
+static void handleButtonPress(CdcButton btn) {
     uint32_t now = millis();
     String logMsg;
 
     // --- Debounce Filter ---
-    if (btn == g_lastButton && (now - g_lastButtonTime < 300)) {
+    if (btn == g_lastButton && (now - g_lastButtonTime < DEBOUNCE_MS)) {
         return; 
     }
     g_lastButton = btn;
@@ -163,9 +209,11 @@ static void onCdcButton(CdcButton btn) {
 
     // --- Double Press Logic for CD6 ---
     if (btn == CdcButton::DISC_6) {
-        if (now - g_cd6PressTime < 500) {
+        if (now - g_cd6PressTime < DOUBLE_PRESS_WINDOW_MS) {
             g_cd6PressTime = 0; 
-            return onCdcButton(CdcButton::DISC_6_DOUBLE_PRESS);
+            // Рекурсивный вызов заменяем прямым
+            handleButtonPress(CdcButton::DISC_6_DOUBLE_PRESS);
+            return;
         } else {
             g_cd6PressTime = now;
             return;
@@ -181,8 +229,14 @@ static void onCdcButton(CdcButton btn) {
                 g_currentTrack = 1;
             }
             bumpTrackForward();
-            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
-            bt1036_nextTrack();
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                xSemaphoreGive(g_cdcMutex);
+            }
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                bt1036_nextTrack();
+                xSemaphoreGive(g_btMutex);
+            }
             logMsg = String("[BTN] ") + btnName + " → BT: Next, Track " + String(g_currentTrack);
             break;
 
@@ -192,27 +246,41 @@ static void onCdcButton(CdcButton btn) {
                 g_currentTrack = 2;
             }
             bumpTrackBackward();
-            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
-            bt1036_prevTrack();
+             if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                xSemaphoreGive(g_cdcMutex);
+            }
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                bt1036_prevTrack();
+                xSemaphoreGive(g_btMutex);
+            }
             logMsg = String("[BTN ") + btnName + " → BT: Prev, Track " + String(g_currentTrack);
             break;
 
         case CdcButton::PLAY_PAUSE:
             g_isPlaying = !g_isPlaying;
-            if (g_isPlaying) {
-                bt1036_play();
-                cdc_setPlayState(CdcPlayState::PLAYING);
-            } else {
-                bt1036_pause();
-                cdc_setPlayState(CdcPlayState::PAUSED);
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                if (g_isPlaying) bt1036_play();
+                else bt1036_pause();
+                xSemaphoreGive(g_btMutex);
+            }
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setPlayState(g_isPlaying ? CdcPlayState::PLAYING : CdcPlayState::PAUSED);
+                xSemaphoreGive(g_cdcMutex);
             }
             logMsg = String("[BTN] ") + btnName + " → BT: " + (g_isPlaying ? "Play" : "Pause");
             break;
 
         case CdcButton::STOP:
             g_isPlaying = false;
-            bt1036_stop();
-            cdc_setPlayState(CdcPlayState::STOPPED);
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                bt1036_stop();
+                xSemaphoreGive(g_btMutex);
+            }
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setPlayState(CdcPlayState::STOPPED);
+                xSemaphoreGive(g_cdcMutex);
+            }
             logMsg = String("[BTN] ") + btnName + " → BT: Stop";
             break;
 
@@ -223,21 +291,28 @@ static void onCdcButton(CdcButton btn) {
 
         case CdcButton::DISC_1: {
             g_isPlaying = !g_isPlaying;
-            if (g_isPlaying) {
-                bt1036_play();
-                cdc_setPlayState(CdcPlayState::PLAYING);
-                logMsg = String("[BTN] ") + btnName + " → BT: Play";
-            } else {
-                bt1036_pause();
-                cdc_setPlayState(CdcPlayState::PAUSED);
-                logMsg = String("[BTN] ") + btnName + " → BT: Pause";
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                if (g_isPlaying) bt1036_play();
+                else bt1036_pause();
+                xSemaphoreGive(g_btMutex);
             }
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setPlayState(g_isPlaying ? CdcPlayState::PLAYING : CdcPlayState::PAUSED);
+                xSemaphoreGive(g_cdcMutex);
+            }
+            logMsg = String("[BTN] ") + btnName + " → BT: " + (g_isPlaying ? "Play" : "Pause");
             break;
         }
 
         case CdcButton::DISC_2:
-            bt1036_stop();
-            cdc_setPlayState(CdcPlayState::STOPPED);
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                bt1036_stop();
+                xSemaphoreGive(g_btMutex);
+            }
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setPlayState(CdcPlayState::STOPPED);
+                xSemaphoreGive(g_cdcMutex);
+            }
             logMsg = String("[BTN] ") + btnName + " → BT: Stop";
             break;
 
@@ -247,20 +322,32 @@ static void onCdcButton(CdcButton btn) {
             break;
 
         case CdcButton::DISC_4:
-            bt1036_enterPairingMode();
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                bt1036_enterPairingMode();
+                xSemaphoreGive(g_btMutex);
+            }
             g_displayMode = DisplayMode::WAITING_FOR_BT;
             g_isPairingMode = true;
-            g_currentTrack = 80;
-            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
-            logMsg = String("[BTN] ") + btnName + " → BT: Pairing Mode (TRACK 80)";
+            g_currentTrack = DisplayTracks::WAITING_FOR_BT;
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                xSemaphoreGive(g_cdcMutex);
+            }
+            logMsg = String("[BTN] ") + btnName + " → BT: Pairing Mode (TRACK " + String(DisplayTracks::WAITING_FOR_BT) + ")";
             break;
 
         case CdcButton::DISC_5:
-            bt1036_disconnect();
-            bt1036_hfpDisconnect();
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                bt1036_disconnect();
+                bt1036_hfpDisconnect();
+                xSemaphoreGive(g_btMutex);
+            }
             g_displayMode = DisplayMode::WAITING_FOR_BT;
-            g_currentTrack = 80;
-            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+            g_currentTrack = DisplayTracks::WAITING_FOR_BT;
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                xSemaphoreGive(g_cdcMutex);
+            }
             logMsg = String("[BTN] ") + btnName + " → BT: Disconnect";
             break;
 
@@ -274,15 +361,27 @@ static void onCdcButton(CdcButton btn) {
             break;
             
         case CdcButton::SCAN_TOGGLE:
-            bt1036_hangupCall();
-            cdc_setScan(true);
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                bt1036_hangupCall();
+                xSemaphoreGive(g_btMutex);
+            }
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setScan(true);
+                xSemaphoreGive(g_cdcMutex);
+            }
             g_scanResetTime = millis() + 500;
             logMsg = String("[BTN] ") + btnName + " → HFP: Hangup";
             break;
 
         case CdcButton::RANDOM_TOGGLE:
-            bt1036_answerCall();
-            cdc_setRandom(true);
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                bt1036_answerCall();
+                xSemaphoreGive(g_btMutex);
+            }
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setRandom(true);
+                xSemaphoreGive(g_cdcMutex);
+            }
             g_mixResetTime = millis() + 500;
             logMsg = String("[BTN] ") + btnName + " → HFP: Answer Call";
             break;
@@ -295,6 +394,36 @@ static void onCdcButton(CdcButton btn) {
     
     if (logMsg.length() > 0) {
         btWebUI_log(logMsg, LogLevel::INFO);
+    }
+}
+
+// ============================================================================
+// TASKS
+// ============================================================================
+
+void cdc_task(void *parameter) {
+    btWebUI_log("[TASK] CDC task started", LogLevel::DEBUG);
+    for (;;) {
+        cdc_loop();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void bt_task(void *parameter) {
+    btWebUI_log("[TASK] BT task started", LogLevel::DEBUG);
+    for (;;) {
+        bt1036_loop();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void webui_task(void *parameter) {
+    btWebUI_log("[TASK] WebUI task started", LogLevel::DEBUG);
+    for (;;) {
+        if (g_wifiEnabled) {
+            btWebUI_loop();
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -312,6 +441,11 @@ void setup() {
     if (g_wifiEnabled) {
         btWebUI_init();
     }
+    
+    // Создаем очередь и мьютексы ДО инициализации модулей
+    g_buttonQueue = xQueueCreate(10, sizeof(CdcButton)); 
+    g_cdcMutex = xSemaphoreCreateMutex();
+    g_btMutex = xSemaphoreCreateMutex();
 
     esp_reset_reason_t reason = esp_reset_reason();
     const char* reasonStr = "Unknown";
@@ -335,7 +469,7 @@ void setup() {
 
     bt1036_init(Serial2, BT_RX_PIN, BT_TX_PIN);
 
-    g_currentTrack = 80;
+    g_currentTrack = DisplayTracks::WAITING_FOR_BT;
     g_displayMode = DisplayMode::WAITING_FOR_BT;
     cdc_setDiscTrack(g_currentDisc, g_currentTrack);
     cdc_setPlayState(CdcPlayState::PLAYING);
@@ -343,111 +477,170 @@ void setup() {
     cdc_setScan(false);
     cdc_init(CDC_SCK_PIN, CDC_MISO_PIN, CDC_MOSI_PIN, CDC_SS_PIN, CDC_NEC_PIN, onCdcButton);
 
-    btWebUI_log("[MAIN] Init complete.", LogLevel::INFO);
+    btWebUI_log("[MAIN] Init complete. Starting tasks...", LogLevel::INFO);
+    
+    xTaskCreate(cdc_task, "CDCTask", CDC_TASK_STACK_SIZE, NULL, CDC_TASK_PRIORITY, NULL);
+    xTaskCreate(bt_task, "BTTask", BT_TASK_STACK_SIZE, NULL, BT_TASK_PRIORITY, NULL);
+    xTaskCreate(webui_task, "WebUITask", WEBUI_TASK_STACK_SIZE, NULL, WEBUI_TASK_PRIORITY, NULL);
 }
 
 // ============================================================================
-// MAIN LOOP
+// MAIN LOOP (теперь это фоновая задача с низким приоритетом)
 // ============================================================================
 void loop() {
     esp_task_wdt_reset();
 
-    bt1036_loop();
-    cdc_loop();
-    if (g_wifiEnabled) {
-        btWebUI_loop();
+    // Проверяем очередь на наличие нажатых кнопок
+    CdcButton btn;
+    if (xQueueReceive(g_buttonQueue, &btn, (TickType_t)0) == pdPASS) {
+        handleButtonPress(btn);
     }
     
-    if (g_cd6PressTime > 0 && (millis() - g_cd6PressTime >= 500)) {
+    // Обработка одиночного нажатия CD6 с задержкой
+    if (g_cd6PressTime > 0 && (millis() - g_cd6PressTime >= DOUBLE_PRESS_WINDOW_MS)) {
         g_cd6PressTime = 0; 
         
-        // Теперь выполняем действие для ОДИНОЧНОГО нажатия CD6
-        bt1036_clearPairedDevices();
+        if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+            bt1036_clearPairedDevices();
+            xSemaphoreGive(g_btMutex);
+        }
         g_displayMode = DisplayMode::WAITING_FOR_BT;
         g_isPairingMode = true;
-        g_currentTrack = 80;
-        cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+        g_currentTrack = DisplayTracks::WAITING_FOR_BT;
+        if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+            xSemaphoreGive(g_cdcMutex);
+        }
         btWebUI_log("[BTN] CD6 → BT: Clear Paired Devices", LogLevel::INFO);
     }
 
+    // Сброс индикаторов SCAN/MIX на магнитоле
     if (g_scanResetTime > 0 && millis() > g_scanResetTime) {
         g_scanResetTime = 0;
-        cdc_setScan(false);
+        if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+            cdc_setScan(false);
+            xSemaphoreGive(g_cdcMutex);
+        }
     }
     
     if (g_mixResetTime > 0 && millis() > g_mixResetTime) {
         g_mixResetTime = 0;
-        cdc_setRandom(false);
-        cdc_resetModeFF();
+        if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+            cdc_setRandom(false);
+            cdc_resetModeFF();
+            xSemaphoreGive(g_cdcMutex);
+        }
     }
     
-    BTConnState currentBtState = bt1036_getState();
+    // --- Главная машина состояний по статусу BT ---
+    BTConnState currentBtState;
+    if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+        currentBtState = bt1036_getState();
+        xSemaphoreGive(g_btMutex);
+    }
     
+    // Событие: только что подключились
     if (g_lastBtState == BTConnState::DISCONNECTED && 
         (currentBtState == BTConnState::CONNECTED_IDLE || 
          currentBtState == BTConnState::PLAYING || 
          currentBtState == BTConnState::PAUSED)) {
         
-        bt1036_setVolume(15);
+        if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+            bt1036_setVolume(15);
+            xSemaphoreGive(g_btMutex);
+        }
         btWebUI_log("[MAIN] Set BT volume to MAX (15)", LogLevel::INFO);
 
-        if (g_isPairingMode) {
+        if (g_isPairingMode) { // Подключилось новое устройство
             g_displayMode = DisplayMode::JUST_CONNECTED;
             g_connectedShowTime = millis();
-            g_currentTrack = 10;
-            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+            g_currentTrack = DisplayTracks::JUST_CONNECTED;
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                xSemaphoreGive(g_cdcMutex);
+            }
             g_autoPlaySent = false;
-            btWebUI_log("[MAIN] New device connected! Showing TRACK 10 for 5 sec", LogLevel::INFO);
-        } else {
+            btWebUI_log(String("[MAIN] New device connected! Showing TRACK ") + String(DisplayTracks::JUST_CONNECTED) + " for 5 sec", LogLevel::INFO);
+        } else { // Авто-реконнект
             g_displayMode = DisplayMode::NORMAL_PLAYBACK;
             g_currentTrack = 1;
             g_isPlaying = true;
-            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
-            cdc_setPlayState(CdcPlayState::PLAYING);
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                cdc_setPlayState(CdcPlayState::PLAYING);
+                xSemaphoreGive(g_cdcMutex);
+            }
             
             if (!g_autoPlaySent) {
                 g_autoPlaySent = true;
-                bt1036_play();
+                if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                    bt1036_play();
+                    xSemaphoreGive(g_btMutex);
+                }
                 btWebUI_log("[MAIN] Auto-reconnect! Instant play sent", LogLevel::INFO);
             }
         }
     }
     
+    // Событие: только что отключились
     if (currentBtState == BTConnState::DISCONNECTED && 
         g_lastBtState != BTConnState::DISCONNECTED) {
         g_displayMode = DisplayMode::WAITING_FOR_BT;
-        g_currentTrack = 80;
-        cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+        g_currentTrack = DisplayTracks::WAITING_FOR_BT;
+        if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+            xSemaphoreGive(g_cdcMutex);
+        }
         g_autoPlaySent = false;
-        btWebUI_log("[MAIN] BT Disconnected. Showing TRACK 80", LogLevel::INFO);
+        btWebUI_log(String("[MAIN] BT Disconnected. Showing TRACK ") + String(DisplayTracks::WAITING_FOR_BT), LogLevel::INFO);
     }
     
     g_lastBtState = currentBtState;
     
+    // --- Логика режимов отображения ---
     if (g_displayMode == DisplayMode::JUST_CONNECTED) {
         if (millis() - g_connectedShowTime > 5000) {
             g_displayMode = DisplayMode::NORMAL_PLAYBACK;
             g_currentTrack = 1;
             g_isPlaying = true;
             g_isPairingMode = false;
-            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                xSemaphoreGive(g_cdcMutex);
+            }
             btWebUI_log("[MAIN] Switching to normal playback mode (TRACK 1)", LogLevel::INFO);
             
             if (!g_autoPlaySent) {
                 g_autoPlaySent = true;
-                bt1036_play();
-                cdc_setPlayState(CdcPlayState::PLAYING);
+                if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                    bt1036_play();
+                    xSemaphoreGive(g_btMutex);
+                }
+                if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                    cdc_setPlayState(CdcPlayState::PLAYING);
+                    xSemaphoreGive(g_cdcMutex);
+                }
                 btWebUI_log("[MAIN] Auto-play sent", LogLevel::INFO);
             }
         }
     }
     
     if (g_displayMode == DisplayMode::NORMAL_PLAYBACK) {
-        TrackInfo ti = bt1036_getTrackInfo();
+        TrackInfo ti;
+        if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+            ti = bt1036_getTrackInfo();
+            xSemaphoreGive(g_btMutex);
+        }
         if (ti.valid && ti.elapsedSec > 0) {
             uint8_t mins = ti.elapsedSec / 60;
             uint8_t secs = ti.elapsedSec % 60;
-            cdc_setPlayTime(mins, secs);
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setPlayTime(mins, secs);
+                xSemaphoreGive(g_cdcMutex);
+            }
         }
     }
+
+    // Небольшая задержка, чтобы дать поработать другим задачам
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
