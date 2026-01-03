@@ -5,7 +5,7 @@
 static HardwareSerial *bt = nullptr;
 
 // ---------- очередь команд ----------
-static const size_t   CMD_QUEUE_SIZE    = 10;
+static const size_t   CMD_QUEUE_SIZE    = 40;
 static const size_t   CMD_MAX_LEN       = 48;
 static char           cmdQueue[CMD_QUEUE_SIZE][CMD_MAX_LEN];
 static uint8_t        queueHead         = 0;
@@ -45,6 +45,12 @@ static void queuePush(const String &cmd) {
     strncpy(cmdQueue[queueTail], cmd.c_str(), CMD_MAX_LEN - 1);
     cmdQueue[queueTail][CMD_MAX_LEN - 1] = '\0'; // Ensure null-termination
     queueTail = (queueTail + 1) % CMD_QUEUE_SIZE;
+}
+
+void bt1036_clearQueue() {
+    queueHead = queueTail;
+    cmdInProgress = false;
+    btWebUI_log("[BT] Command queue cleared", LogLevel::INFO);
 }
 
 static const char* queueFront() {
@@ -409,6 +415,7 @@ void bt1036_setMicMute(bool muteOn) {
 
 // ---------- System ----------
 void bt1036_softReboot() {
+    bt1036_clearQueue();
     queuePush(String(F("AT+REBOOT")));
 }
 
@@ -588,6 +595,7 @@ void bt1036_pausePolling(bool pause) {
 // ---------- Одноразовая "фабричная" настройка (опционально) ----------
 void bt1036_runFactorySetup() {
     btWebUI_log("[BT] Running factory setup...", LogLevel::INFO);
+    bt1036_clearQueue();
     bt1036_pausePolling(true); // Приостанавливаем опрос
 
     // 1. Принудительно останавливаем все активности

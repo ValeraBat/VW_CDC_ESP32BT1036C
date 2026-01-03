@@ -84,6 +84,7 @@ void bt1036_setMicMute(bool muteOn);      // AT+MICMUTE=0/1
 void bt1036_softReboot();                 // AT+REBOOT
 void bt1036_setBtEnabled(bool enabled);   // AT+BTEN=0/1
 void bt1036_sendRawCommand(const String& cmd); // Для ручного ввода команд
+void bt1036_clearQueue();                 // Очистить очередь команд
 
 // ---- Геттеры состояния ----
 BTConnState bt1036_getState();

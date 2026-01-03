@@ -72,6 +72,7 @@ static const uint8_t CDC_MISO_PIN = -1;  // Not used (radio doesn't send SPI dat
 static const uint8_t CDC_MOSI_PIN = 23;  // VSPI MOSI → VW Radio
 static const int8_t  CDC_SS_PIN   = -1;  // Not used (single device)
 static const uint8_t CDC_NEC_PIN  =  4;  // VW DataOut ← Radio (button commands)
+static const uint8_t STATUS_LED_PIN = 2;   // Blue LED on ESP32-S2 board
 
 // ============================================================================
 // WIFI STATE
@@ -466,6 +467,10 @@ void setup() {
     btWebUI_log(String("[MAIN] Reset reason: ") + reasonStr, LogLevel::INFO);
     btWebUI_log(String("[MAIN] WiFi is ") + (g_wifiEnabled ? "ENABLED" : "DISABLED"), LogLevel::INFO);
     btWebUI_log("[MAIN] VW CDC + BT1036 emulator start", LogLevel::INFO);
+
+    // --- Status LED ---
+    pinMode(STATUS_LED_PIN, OUTPUT);
+    digitalWrite(STATUS_LED_PIN, g_wifiEnabled ? HIGH : LOW); 
 
     bt1036_init(Serial2, BT_RX_PIN, BT_TX_PIN);
 
