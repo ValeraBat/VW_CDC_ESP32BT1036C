@@ -41,8 +41,8 @@ Radio CD buttons are remapped to Bluetooth functions:
 | **CD3** | Mic Mute toggle |
 | **CD4** | Enter Pairing Mode |
 | **CD5** | Disconnect device |
-| **CD6** | Clear paired devices |
-| **CD6 (Double Press)** | Toggle WiFi & Reboot |
+| **CD5 (Double)** | Clear Paired List |
+| **CD6** | Toggle WiFi & Reboot |
 | **SCAN** | Hangup call |
 | **MIX** | Answer call |
 | **◀◀ / ▶▶** | Previous/Next track |
@@ -53,11 +53,14 @@ The track number on radio display indicates BT status:
 
 | Track | Status |
 |-------|--------|
-| **80** | Waiting for BT connection |
-| **10** | Device just connected (5 sec) |
-| **90** | WiFi is OFF |
-| **91** | WiFi is ON |
 | **1+** | Normal playback mode |
+| **88** | Waiting for BT connection |
+| **33** | Mic Mute active |
+| **44** | Pairing mode |
+| **55** | Manual Disconnect |
+| **54** | Paired list cleared |
+| **60** | WiFi is OFF |
+| **61** | WiFi is ON |
 
 ## Web Interface
 
@@ -109,6 +112,11 @@ src/
 ├── vw_cdc.cpp/h    # CDC emulator + button decoder
 └── bt_webui.cpp/h  # Web UI, WebSocket, OTA
 ```
+
+## Documentation
+
+- BT1036C AT command set links: [docs/bt1036c_links.md](docs/bt1036c_links.md)
+
 ## License
 
 MIT License

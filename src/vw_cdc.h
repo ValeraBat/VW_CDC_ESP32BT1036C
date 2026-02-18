@@ -14,14 +14,14 @@
 #pragma once
 #include <Arduino.h>
 
-// Состояние воспроизведения
+// Playback state
 enum class CdcPlayState {
     STOPPED,
     PLAYING,
     PAUSED
 };
 
-// Кнопки/действия от магнитолы
+// Buttons/actions from the head unit
 enum class CdcButton {
     NEXT_TRACK,
     PREV_TRACK,
@@ -37,55 +37,54 @@ enum class CdcButton {
     DISC_4,
     DISC_5,
     DISC_6,
-    DISC_6_DOUBLE_PRESS, // Новое событие для двойного нажатия CD6
     UNKNOWN
 };
 
 
-// Состояние для отображения (если понадобится)
+// CDC status for display
 struct CdcStatus {
     uint8_t      disc;      // 1..6
     uint8_t      track;     // 1..99
     CdcPlayState state;
     bool         randomOn;  // shuffle
-    bool         scanOn;    // scan-режим
+    bool         scanOn;    // scan mode
 };
 
-// callback: магнитола нажала кнопку (или послала команду)
+// Callback: radio button press or command received
 typedef void (*CdcButtonCallback)(CdcButton btn);
 
-// Инициализация CDC-эмулятора.
-// sck, miso, mosi, ss — пины SPI шины, подключённой к RNS-MFD.
-// necPin — отдельный пин для приема NEC IR сигнала от магнитолы.
-// buttonCb — колбэк, который будет вызываться при командах от магнитолы.
+// Initialize the CDC emulator.
+// sck, miso, mosi, ss — SPI bus pins connected to RNS-MFD.
+// necPin — separate pin for receiving button commands from the radio.
+// buttonCb — callback invoked on radio button presses.
 void cdc_init(int sckPin, int misoPin, int mosiPin, int ssPin, int necPin,
               CdcButtonCallback buttonCb = nullptr);
 
-// Вызывать в loop()
+// Call in loop()
 void cdc_loop();
 
-// --- API для BT-слоя / логики плеера ---
+// --- API for BT layer / player logic ---
 
-// Установить диск и трек (1..6, 1..99)
+// Set disc and track (1..6, 1..99)
 void cdc_setDiscTrack(uint8_t disc, uint8_t track);
 
-// Состояние воспроизведения
+// Set playback state
 void cdc_setPlayState(CdcPlayState st);
 
-// Включить/выключить shuffle (SFL)
+// Enable/disable shuffle (SFL)
 void cdc_setRandom(bool on);
 
-// Включить/выключить scan
+// Enable/disable scan
 void cdc_setScan(bool on);
 
-// Сбросить modeByte в 0xFF (нейтральное значение)
+// Reset modeByte to 0xFF (neutral value)
 void cdc_resetModeFF();
 
-// Установить время воспроизведения (minutes 0-99, seconds 0-59)
+// Set playback time (minutes 0-99, seconds 0-59)
 void cdc_setPlayTime(uint8_t minutes, uint8_t seconds);
 
-// Получить текущее состояние
+// Get current status
 CdcStatus cdc_getStatus();
 
-// Приостановить/возобновить обработку прерываний
+// Pause/resume interrupt processing
 void cdc_pause(bool pause);

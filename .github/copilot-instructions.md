@@ -43,10 +43,13 @@ VW Radio (NEC IR) → CDC Decoder (ISR) → Button Callbacks → BT Commands (Qu
 ### 3. Button Remapping Strategy
 See `main.cpp:onCdcButton()` - CD1-CD3 buttons repurposed:
 - **CD1** → Play/Pause (not disc select)
-- **CD2** → Stop/Disconnect
+- **CD2** → Stop
 - **CD3** → HFP mic mute toggle
-- **SCAN** → Answer call
-- **RANDOM** → Hangup call
+- **CD4** → Enter Pairing Mode
+- **CD5** → Disconnect current device
+- **CD6** → Toggle WiFi ON/OFF
+- **SCAN** → Hangup call
+- **RANDOM** → Answer call
 - Track buttons map to `AT+FORWARD`/`AT+BACKWARD`
 
 ### 4. Web UI Architecture

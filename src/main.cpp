@@ -12,8 +12,7 @@
  *   CD3 = HFP Mic Mute toggle
  *   CD4 = Enter Pairing Mode (TRACK 80)
  *   CD5 = Disconnect current device
- *   CD6 = Clear all paired devices
- *   CD6 (double press) = Toggle WiFi ON/OFF
+ *   CD6 = Toggle WiFi ON/OFF
  *   SCAN = Hangup call
  *   MIX = Answer call
  *   <</>>	= Prev/Next track
@@ -22,13 +21,21 @@
  *   TRACK 80 = Waiting for BT connection
  *   TRACK 10 = Just connected (5 sec)
  *   TRACK 1+ = Normal playback with time from BT
- *   TRACK 90 = WiFi OFF
- *   TRACK 91 = WiFi ON
+ *   TRACK 60 = WiFi OFF
+ *   TRACK 61 = WiFi ON
  */
+
+// ============================================================================
+// FIRMWARE VERSION
+// ============================================================================
+const char* FW_VERSION = "v1.3";
 
 #include <Arduino.h>
 #include <esp_task_wdt.h>
-#include <Preferences.h> // Для сохранения состояния WiFi
+#include <esp_log.h>
+#include <Preferences.h> // For persisting WiFi state in NVS
+#include <WiFi.h>
+#include <cstdarg>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -42,46 +49,48 @@
 // CONSTANTS
 // ============================================================================
 const uint32_t DEBOUNCE_MS = 300;
-const uint32_t DOUBLE_PRESS_WINDOW_MS = 500;
 const uint32_t MUTEX_WAIT_MS = 100;
 
 // Track numbers used for status display
 struct DisplayTracks {
-    static const uint8_t WAITING_FOR_BT = 80;
-    static const uint8_t JUST_CONNECTED = 10;
-    static const uint8_t WIFI_OFF = 90;
-    static const uint8_t WIFI_ON = 91;
+    static const uint8_t WAITING_FOR_BT = 88; // Waiting for connection
+    static const uint8_t WIFI_OFF       = 60; // WiFi Disabled
+    static const uint8_t WIFI_ON        = 61; // WiFi Enabled
+    static const uint8_t MUTE_ON        = 33; // Mute Active
+    static const uint8_t PAIRING        = 44; // Pairing Mode
+    static const uint8_t DISCONNECTED   = 55; // Manually Disconnected
+    static const uint8_t CLEARED_PAIRED = 54; // Cleared Paired List
 };
 
 // FreeRTOS Task settings
 const uint32_t CDC_TASK_STACK_SIZE = 4096;
 const uint32_t BT_TASK_STACK_SIZE = 4096;
-const uint32_t WEBUI_TASK_STACK_SIZE = 4096;
+const uint32_t WEBUI_TASK_STACK_SIZE = 8192;
 const UBaseType_t CDC_TASK_PRIORITY = 3;   // Highest priority for real-time SPI
 const UBaseType_t BT_TASK_PRIORITY = 2;    // Medium priority for BT commands
 const UBaseType_t WEBUI_TASK_PRIORITY = 1; // Lowest priority for Web UI
 
 // ============================================================================
-// PIN CONFIGURATION (ESP-WROVER-KIT / ESP32)
+// PIN CONFIGURATION (ESP32)
 // ============================================================================
-static const uint8_t BT_RX_PIN = 16;  // ESP RX ← BT1036 TX (Serial2)
-static const uint8_t BT_TX_PIN = 17;  // ESP TX → BT1036 RX (Serial2)
+static const uint8_t BT_RX_PIN = 16;  // ESP RX ← BT1036 TX (UART)
+static const uint8_t BT_TX_PIN = 17;  // ESP TX → BT1036 RX (UART)
 
 static const uint8_t CDC_SCK_PIN  = 18;  // VSPI CLK → VW Radio
-static const uint8_t CDC_MISO_PIN = -1;  // Not used (radio doesn't send SPI data back)
+static const uint8_t CDC_MISO_PIN = -1;  // Not used (radio doesn't send SPI data back, needed for SPI initialization)
 static const uint8_t CDC_MOSI_PIN = 23;  // VSPI MOSI → VW Radio
 static const int8_t  CDC_SS_PIN   = -1;  // Not used (single device)
 static const uint8_t CDC_NEC_PIN  =  4;  // VW DataOut ← Radio (button commands)
-static const uint8_t STATUS_LED_PIN = 2;   // Blue LED on ESP32-S2 board
+static const uint8_t STATUS_LED_PIN = 2;   // Blue LED on board
 
 // ============================================================================
 // WIFI STATE
 // ============================================================================
 static bool g_wifiEnabled = true;
 static Preferences g_prefs;
-static QueueHandle_t g_buttonQueue = NULL; // Очередь для нажатий кнопок
-static SemaphoreHandle_t g_cdcMutex = NULL;      // Мьютекс для CDC
-static SemaphoreHandle_t g_btMutex = NULL;       // Мьютекс для BT
+static QueueHandle_t g_buttonQueue = NULL; // Button press queue (ISR -> loop)
+static SemaphoreHandle_t g_cdcMutex = NULL;      // Mutex for CDC access
+static SemaphoreHandle_t g_btMutex = NULL;       // Mutex for BT access
 
 // ============================================================================
 // GLOBAL STATE
@@ -98,28 +107,66 @@ static uint32_t g_mixResetTime = 0;
 // Button Debounce & Double Press state
 static CdcButton g_lastButton = CdcButton::UNKNOWN;
 static uint32_t  g_lastButtonTime = 0;
-static uint32_t  g_cd6PressTime = 0;   // Для отслеживания двойного нажатия CD6
 
 // ============================================================================
 // DISPLAY MODE STATE MACHINE
 // ============================================================================
 enum class DisplayMode {
-    WAITING_FOR_BT,      // TRACK 80 - waiting for connection
-    JUST_CONNECTED,      // TRACK 10 - just connected (5 sec delay)
-    NORMAL_PLAYBACK      // Normal mode - track/time from BT
+    WAITING_FOR_BT,      // Waiting for connection (TRACK 88)
+    NORMAL_PLAYBACK,     // Normal mode - shows track/time from BT
+    MUTE_DISPLAY,        // Mute active (TRACK 33)
+    PAIRING_MODE,        // Explicit pairing mode (TRACK 44)
+    MANUAL_DISCONNECT    // Explicit disconnect (TRACK 55)
 };
 
 static DisplayMode g_displayMode = DisplayMode::WAITING_FOR_BT;
-static uint32_t g_connectedShowTime = 0;             // Timestamp when TRACK 10 was shown
 static BTConnState g_lastBtState = BTConnState::DISCONNECTED;
 static bool g_autoPlaySent = false;                  // Auto-play command already sent
-static bool g_isPairingMode = false;                 // true = waiting for NEW device (CD4/CD6)
+static bool g_isPairingMode = false;                 // true = waiting for NEW device (CD4)
+static bool g_isManualDisconnect = false;            // true = manually disconnected (CD5)
+static bool g_waitingForAvrcp = false;               // true = connected but waiting for AVRCP ready to play
+static uint8_t g_prevTrackBeforeMute = 1;            // To restore track after un-Mute
 
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
-/** Включение/выключение WiFi */
+static int log_vprintf_null(const char * /*fmt*/, va_list /*args*/) {
+    return 0;
+}
+
+static void silenceSerialMonitor() {
+    Serial.setDebugOutput(false);
+    esp_log_level_set("*", ESP_LOG_NONE);
+    esp_log_set_vprintf(&log_vprintf_null);
+}
+
+static void updateStatusLed() {
+    static uint32_t lastToggleMs = 0;
+    static bool ledOn = false;
+
+    if (!g_wifiEnabled) {
+        ledOn = false;
+        digitalWrite(STATUS_LED_PIN, LOW);
+        return;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        ledOn = true;
+        digitalWrite(STATUS_LED_PIN, HIGH);
+        return;
+    }
+
+    // WiFi enabled, but not connected: slow blink
+    uint32_t now = millis();
+    if (now - lastToggleMs >= 500) {
+        lastToggleMs = now;
+        ledOn = !ledOn;
+        digitalWrite(STATUS_LED_PIN, ledOn ? HIGH : LOW);
+    }
+}
+
+/** Toggle WiFi ON/OFF, save to NVS, and reboot */
 static void toggleWiFi() {
     g_wifiEnabled = !g_wifiEnabled;
     g_prefs.begin("sys_config", false);
@@ -129,13 +176,13 @@ static void toggleWiFi() {
     String msg = String("[MAIN] WiFi turned ") + (g_wifiEnabled ? "ON" : "OFF") + ". Rebooting to apply...";
     btWebUI_log(msg, LogLevel::INFO);
     
-    // Показываем на дисплее статус
+    // Show status on the radio display
     if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-        cdc_setDiscTrack(1, g_wifiEnabled ? DisplayTracks::WIFI_ON : DisplayTracks::WIFI_OFF);
+        cdc_setDiscTrack(g_currentDisc, g_wifiEnabled ? DisplayTracks::WIFI_ON : DisplayTracks::WIFI_OFF);
         xSemaphoreGive(g_cdcMutex);
     }
     
-    delay(2000); // Даем время прочитать сообщение и увидеть на дисплее
+    delay(2000); // Allow time for the display to show the status
     ESP.restart();
 }
 
@@ -152,11 +199,35 @@ static void bumpTrackBackward() {
 /** Toggle HFP microphone mute */
 static void toggleHfpMute() {
     g_hfpMuted = !g_hfpMuted;
-    if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        bt1036_setMicMute(g_hfpMuted);
-        xSemaphoreGive(g_btMutex);
+    const bool canSend = bt1036_isHfpAudioActive() || bt1036_isHfpCallInProgress();
+    if (canSend) {
+        if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            bt1036_setMicMute(g_hfpMuted);
+            xSemaphoreGive(g_btMutex);
+        }
+        
+        // --- Mute Display Logic ---
+        if (g_hfpMuted) {
+            // Enter MUTE display mode (Track 33)
+            g_prevTrackBeforeMute = g_currentTrack; // Save current
+            g_displayMode = DisplayMode::MUTE_DISPLAY;
+            g_currentTrack = DisplayTracks::MUTE_ON;
+        } else {
+            // Restore previous mode
+            g_displayMode = DisplayMode::NORMAL_PLAYBACK;
+            g_currentTrack = g_prevTrackBeforeMute;
+        }
+        
+        if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+            xSemaphoreGive(g_cdcMutex);
+        }
+        // --------------------------
+
+        btWebUI_log(String("[MAIN] HFP mic mute: ") + (g_hfpMuted ? "ON" : "OFF"), LogLevel::INFO);
+    } else {
+        btWebUI_log(String("[MAIN] HFP mic mute toggled (no call active): ") + (g_hfpMuted ? "ON" : "OFF"), LogLevel::DEBUG);
     }
-    btWebUI_log(String("[MAIN] HFP mic mute: ") + (g_hfpMuted ? "ON" : "OFF"), LogLevel::INFO);
 }
 
 // ============================================================================
@@ -180,22 +251,21 @@ static const char* getButtonName(CdcButton btn) {
         case CdcButton::DISC_4:        return "CD4";
         case CdcButton::DISC_5:        return "CD5";
         case CdcButton::DISC_6:        return "CD6";
-        case CdcButton::DISC_6_DOUBLE_PRESS: return "CD6_DOUBLE_PRESS";
         case CdcButton::UNKNOWN:       return "UNKNOWN";
         default:                       return "???";
     }
 }
 
 /**
- * @brief Обработчик нажатия кнопки, ВЫЗЫВАЕМЫЙ ИЗ ПРЕРЫВАНИЯ (ISR).
- * Должен быть максимально быстрым. Просто кладет кнопку в очередь.
+ * @brief Button press handler, CALLED FROM ISR.
+ * Must be as fast as possible. Simply enqueues the button.
  */
 static void onCdcButton(CdcButton btn) {
     xQueueSendFromISR(g_buttonQueue, &btn, NULL);
 }
 
 /**
- * @brief ОСНОВНАЯ логика обработки кнопок. Вызывается из главного цикла.
+ * @brief Main button processing logic. Called from the main loop.
  */
 static void handleButtonPress(CdcButton btn) {
     uint32_t now = millis();
@@ -208,19 +278,6 @@ static void handleButtonPress(CdcButton btn) {
     g_lastButton = btn;
     g_lastButtonTime = now;
 
-    // --- Double Press Logic for CD6 ---
-    if (btn == CdcButton::DISC_6) {
-        if (now - g_cd6PressTime < DOUBLE_PRESS_WINDOW_MS) {
-            g_cd6PressTime = 0; 
-            // Рекурсивный вызов заменяем прямым
-            handleButtonPress(CdcButton::DISC_6_DOUBLE_PRESS);
-            return;
-        } else {
-            g_cd6PressTime = now;
-            return;
-        }
-    }
-    
     const char* btnName = getButtonName(btn);
 
     switch (btn) {
@@ -255,7 +312,7 @@ static void handleButtonPress(CdcButton btn) {
                 bt1036_prevTrack();
                 xSemaphoreGive(g_btMutex);
             }
-            logMsg = String("[BTN ") + btnName + " → BT: Prev, Track " + String(g_currentTrack);
+            logMsg = String("[BTN] ") + btnName + " → BT: Prev, Track " + String(g_currentTrack);
             break;
 
         case CdcButton::PLAY_PAUSE:
@@ -318,53 +375,81 @@ static void handleButtonPress(CdcButton btn) {
             break;
 
         case CdcButton::DISC_3:
-            toggleHfpMute();
+            toggleHfpMute(); // Handles display update internally
             logMsg = String("[BTN] ") + btnName + " → Mic Mute: " + (g_hfpMuted ? "ON" : "OFF");
             break;
 
         case CdcButton::DISC_4:
             if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-                bt1036_enterPairingMode();
+                bt1036_enterPairingMode(); // AT+CAIR
                 xSemaphoreGive(g_btMutex);
             }
-            g_displayMode = DisplayMode::WAITING_FOR_BT;
-            g_isPairingMode = true;
-            g_currentTrack = DisplayTracks::WAITING_FOR_BT;
+            g_displayMode = DisplayMode::PAIRING_MODE;
+            g_currentTrack = DisplayTracks::PAIRING; // 44
             if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
                 cdc_setDiscTrack(g_currentDisc, g_currentTrack);
                 xSemaphoreGive(g_cdcMutex);
             }
-            logMsg = String("[BTN] ") + btnName + " → BT: Pairing Mode (TRACK " + String(DisplayTracks::WAITING_FOR_BT) + ")";
+            logMsg = String("[BTN] ") + btnName + " → BT: Pairing Mode (TRACK " + String(DisplayTracks::PAIRING) + ")";
             break;
 
-        case CdcButton::DISC_5:
-            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-                bt1036_disconnect();
-                bt1036_hfpDisconnect();
-                xSemaphoreGive(g_btMutex);
+        case CdcButton::DISC_5: {
+            static uint32_t lastCd5Press = 0;
+            if (now - lastCd5Press < 1000) { // Double press < 1 sec
+                if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                    bt1036_clearPairedDevices(); // Uses AT+DELPD instead of AT+C
+                    g_currentTrack = DisplayTracks::CLEARED_PAIRED; // TRACK 54
+                    xSemaphoreGive(g_btMutex);
+                }
+                
+                if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                    cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                    xSemaphoreGive(g_cdcMutex);
+                }
+                btWebUI_log("[BTN] CD5 (Double) → Clear Paired List (TRACK 54)", LogLevel::INFO);
+                lastCd5Press = 0; // Reset
+            } else {
+                // Single press triggers disconnect logic, but we only SEND commands if connected
+                lastCd5Press = now;
+                g_isManualDisconnect = true;
+
+                if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                    // Only send disconnect if we think we are connected, to avoid ERR logs
+                    BTConnState state = bt1036_getState();
+                    if (state != BTConnState::DISCONNECTED) {
+                        bt1036_disconnect(); // AT+A2DPDISC
+                        bt1036_hfpDisconnect(); // AT+HFPDISC
+                    }
+                    xSemaphoreGive(g_btMutex);
+                }
+                
+                g_displayMode = DisplayMode::MANUAL_DISCONNECT;
+                g_currentTrack = DisplayTracks::DISCONNECTED; // 55
+                
+                if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                    cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                    xSemaphoreGive(g_cdcMutex);
+                }
+                String logMsg = String("[BTN] ") + btnName + " → BT: Disconnect (TRACK 55)";
+                btWebUI_log(logMsg, LogLevel::INFO);
             }
-            g_displayMode = DisplayMode::WAITING_FOR_BT;
-            g_currentTrack = DisplayTracks::WAITING_FOR_BT;
-            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-                cdc_setDiscTrack(g_currentDisc, g_currentTrack);
-                xSemaphoreGive(g_cdcMutex);
-            }
-            logMsg = String("[BTN] ") + btnName + " → BT: Disconnect";
             break;
+        }
 
         case CdcButton::DISC_6:
-            // Handled in loop() for delayed single press
-            break;
-            
-        case CdcButton::DISC_6_DOUBLE_PRESS:
+            // Display feedback is handled inside toggleWiFi()
             toggleWiFi();
             logMsg = String("[BTN] ") + btnName + " → Toggle WiFi";
             break;
             
         case CdcButton::SCAN_TOGGLE:
-            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-                bt1036_hangupCall();
-                xSemaphoreGive(g_btMutex);
+            if (bt1036_isHfpCallInProgress() || bt1036_isHfpAudioActive()) {
+                if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                    bt1036_hangupCall();
+                    xSemaphoreGive(g_btMutex);
+                }
+            } else {
+                btWebUI_log("[BTN] SCAN → HFP hangup ignored (no call)", LogLevel::DEBUG);
             }
             if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
                 cdc_setScan(true);
@@ -375,9 +460,13 @@ static void handleButtonPress(CdcButton btn) {
             break;
 
         case CdcButton::RANDOM_TOGGLE:
-            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-                bt1036_answerCall();
-                xSemaphoreGive(g_btMutex);
+            if (bt1036_isHfpCallIncoming()) {
+                if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                    bt1036_answerCall();
+                    xSemaphoreGive(g_btMutex);
+                }
+            } else {
+                btWebUI_log("[BTN] RANDOM/MIX → HFP answer ignored (no incoming call)", LogLevel::DEBUG);
             }
             if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
                 cdc_setRandom(true);
@@ -432,6 +521,8 @@ void webui_task(void *parameter) {
 // SETUP
 // ============================================================================
 void setup() {
+    silenceSerialMonitor();
+
     esp_task_wdt_init(15, true); 
     esp_task_wdt_add(NULL);
 
@@ -443,7 +534,7 @@ void setup() {
         btWebUI_init();
     }
     
-    // Создаем очередь и мьютексы ДО инициализации модулей
+    // Create queue and mutexes BEFORE initializing modules
     g_buttonQueue = xQueueCreate(10, sizeof(CdcButton)); 
     g_cdcMutex = xSemaphoreCreateMutex();
     g_btMutex = xSemaphoreCreateMutex();
@@ -470,9 +561,11 @@ void setup() {
 
     // --- Status LED ---
     pinMode(STATUS_LED_PIN, OUTPUT);
-    digitalWrite(STATUS_LED_PIN, g_wifiEnabled ? HIGH : LOW); 
+    digitalWrite(STATUS_LED_PIN, g_wifiEnabled ? HIGH : LOW);
 
-    bt1036_init(Serial2, BT_RX_PIN, BT_TX_PIN);
+    // ESP32-S2 Arduino core does not expose Serial2; Serial1 works on both ESP32 and ESP32-S2
+    // because bt1036_init() remaps RX/TX pins in begin().
+    bt1036_init(Serial1, BT_RX_PIN, BT_TX_PIN);
 
     g_currentTrack = DisplayTracks::WAITING_FOR_BT;
     g_displayMode = DisplayMode::WAITING_FOR_BT;
@@ -490,36 +583,20 @@ void setup() {
 }
 
 // ============================================================================
-// MAIN LOOP (теперь это фоновая задача с низким приоритетом)
+// MAIN LOOP (runs as a low-priority background task)
 // ============================================================================
 void loop() {
     esp_task_wdt_reset();
 
-    // Проверяем очередь на наличие нажатых кнопок
+    updateStatusLed();
+
+    // Check button queue for pending presses
     CdcButton btn;
     if (xQueueReceive(g_buttonQueue, &btn, (TickType_t)0) == pdPASS) {
         handleButtonPress(btn);
     }
     
-    // Обработка одиночного нажатия CD6 с задержкой
-    if (g_cd6PressTime > 0 && (millis() - g_cd6PressTime >= DOUBLE_PRESS_WINDOW_MS)) {
-        g_cd6PressTime = 0; 
-        
-        if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-            bt1036_clearPairedDevices();
-            xSemaphoreGive(g_btMutex);
-        }
-        g_displayMode = DisplayMode::WAITING_FOR_BT;
-        g_isPairingMode = true;
-        g_currentTrack = DisplayTracks::WAITING_FOR_BT;
-        if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-            cdc_setDiscTrack(g_currentDisc, g_currentTrack);
-            xSemaphoreGive(g_cdcMutex);
-        }
-        btWebUI_log("[BTN] CD6 → BT: Clear Paired Devices", LogLevel::INFO);
-    }
-
-    // Сброс индикаторов SCAN/MIX на магнитоле
+    // Reset SCAN/MIX indicators on the radio display
     if (g_scanResetTime > 0 && millis() > g_scanResetTime) {
         g_scanResetTime = 0;
         if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
@@ -537,14 +614,14 @@ void loop() {
         }
     }
     
-    // --- Главная машина состояний по статусу BT ---
+    // --- Main BT connection state machine ---
     BTConnState currentBtState;
     if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
         currentBtState = bt1036_getState();
         xSemaphoreGive(g_btMutex);
     }
     
-    // Событие: только что подключились
+    // Event: just connected
     if (g_lastBtState == BTConnState::DISCONNECTED && 
         (currentBtState == BTConnState::CONNECTED_IDLE || 
          currentBtState == BTConnState::PLAYING || 
@@ -556,17 +633,30 @@ void loop() {
         }
         btWebUI_log("[MAIN] Set BT volume to MAX (15)", LogLevel::INFO);
 
-        if (g_isPairingMode) { // Подключилось новое устройство
-            g_displayMode = DisplayMode::JUST_CONNECTED;
-            g_connectedShowTime = millis();
-            g_currentTrack = DisplayTracks::JUST_CONNECTED;
+        if (g_isPairingMode) { // New device connected (via Pair)
+            // User requested immediate switch to normal playback (Track 1)
+            g_displayMode = DisplayMode::NORMAL_PLAYBACK;
+            g_currentTrack = 1;
+            g_isPairingMode = false;
+
             if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
                 cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                cdc_setPlayState(CdcPlayState::PLAYING);
                 xSemaphoreGive(g_cdcMutex);
             }
+            
             g_autoPlaySent = false;
-            btWebUI_log(String("[MAIN] New device connected! Showing TRACK ") + String(DisplayTracks::JUST_CONNECTED) + " for 5 sec", LogLevel::INFO);
-        } else { // Авто-реконнект
+            btWebUI_log("[MAIN] New device connected! Immediate switch to TRACK 1", LogLevel::INFO);
+            
+            // Trigger auto-play logic DELAYED (wait for AVRCP)
+            if (!g_autoPlaySent) {
+                g_waitingForAvrcp = true; 
+                btWebUI_log("[MAIN] Connected (Pairing). Waiting for AVRCP ready...", LogLevel::INFO);
+            }
+
+        } else { // Auto-reconnect (existing device)
+            // If we came from manual disconnect, maybe we should treat it as new connection?
+            // But usually auto-reconnect happens on boot or range return.
             g_displayMode = DisplayMode::NORMAL_PLAYBACK;
             g_currentTrack = 1;
             g_isPlaying = true;
@@ -577,17 +667,13 @@ void loop() {
             }
             
             if (!g_autoPlaySent) {
-                g_autoPlaySent = true;
-                if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-                    bt1036_play();
-                    xSemaphoreGive(g_btMutex);
-                }
-                btWebUI_log("[MAIN] Auto-reconnect! Instant play sent", LogLevel::INFO);
+                g_waitingForAvrcp = true;
+                btWebUI_log("[MAIN] Connected (Auto). Waiting for AVRCP ready...", LogLevel::INFO);
             }
         }
     }
     
-    // Событие: только что отключились
+    // Event: just disconnected
     if (currentBtState == BTConnState::DISCONNECTED && 
         g_lastBtState != BTConnState::DISCONNECTED) {
         g_displayMode = DisplayMode::WAITING_FOR_BT;
@@ -596,47 +682,59 @@ void loop() {
             cdc_setDiscTrack(g_currentDisc, g_currentTrack);
             xSemaphoreGive(g_cdcMutex);
         }
+        g_hfpMuted = false; // Reset mute state
         g_autoPlaySent = false;
         btWebUI_log(String("[MAIN] BT Disconnected. Showing TRACK ") + String(DisplayTracks::WAITING_FOR_BT), LogLevel::INFO);
     }
     
     g_lastBtState = currentBtState;
-    
-    // --- Логика режимов отображения ---
-    if (g_displayMode == DisplayMode::JUST_CONNECTED) {
-        if (millis() - g_connectedShowTime > 5000) {
-            g_displayMode = DisplayMode::NORMAL_PLAYBACK;
-            g_currentTrack = 1;
-            g_isPlaying = true;
-            g_isPairingMode = false;
-            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-                cdc_setDiscTrack(g_currentDisc, g_currentTrack);
-                xSemaphoreGive(g_cdcMutex);
-            }
-            btWebUI_log("[MAIN] Switching to normal playback mode (TRACK 1)", LogLevel::INFO);
+
+    // --- Check for AVRCP Ready to Trigger Auto-Play ---
+    if (g_waitingForAvrcp) {
+        bool ready = false;
+        if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+             ready = bt1036_isAvrcpReady();
+             xSemaphoreGive(g_btMutex);
+        }
+
+        if (ready) {
+            btWebUI_log("[MAIN] AVRCP is READY. Sending Auto-Play.", LogLevel::INFO);
+            g_waitingForAvrcp = false;
+            g_autoPlaySent = true;
             
-            if (!g_autoPlaySent) {
-                g_autoPlaySent = true;
-                if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-                    bt1036_play();
-                    xSemaphoreGive(g_btMutex);
-                }
-                if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
-                    cdc_setPlayState(CdcPlayState::PLAYING);
-                    xSemaphoreGive(g_cdcMutex);
-                }
-                btWebUI_log("[MAIN] Auto-play sent", LogLevel::INFO);
+            if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                 bt1036_play();
+                 xSemaphoreGive(g_btMutex);
             }
         }
     }
     
+    // --- Display mode logic ---
+    
     if (g_displayMode == DisplayMode::NORMAL_PLAYBACK) {
+        
+        // Check for track change
+        bool trackChanged = false;
+        if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+             trackChanged = bt1036_checkTrackChanged();
+             xSemaphoreGive(g_btMutex);
+        }
+        
+        if (trackChanged) {
+            bumpTrackForward();
+            if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
+                cdc_setDiscTrack(g_currentDisc, g_currentTrack);
+                xSemaphoreGive(g_cdcMutex);
+            }
+            btWebUI_log("[MAIN] Track changed on phone -> increments track", LogLevel::INFO);
+        }
+
         TrackInfo ti;
         if (xSemaphoreTake(g_btMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
             ti = bt1036_getTrackInfo();
             xSemaphoreGive(g_btMutex);
         }
-        if (ti.valid && ti.elapsedSec > 0) {
+        if (ti.valid) {  // removed ti.elapsedSec > 0 check so 0:00 displays
             uint8_t mins = ti.elapsedSec / 60;
             uint8_t secs = ti.elapsedSec % 60;
             if (xSemaphoreTake(g_cdcMutex, pdMS_TO_TICKS(MUTEX_WAIT_MS)) == pdTRUE) {
@@ -646,6 +744,6 @@ void loop() {
         }
     }
 
-    // Небольшая задержка, чтобы дать поработать другим задачам
+    // Small delay to yield CPU to other tasks
     vTaskDelay(pdMS_TO_TICKS(10));
 }
