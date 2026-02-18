@@ -26,11 +26,11 @@
 extern WebServer webServer;
 extern bool g_debugMode;  // Debug mode flag
 
-// Уровни логирования
+// Log levels
 enum class LogLevel : uint8_t {
-    INFO,    // Важные события (всегда видны)
-    DEBUG,   // Отладочные сообщения (только при g_debugMode)
-    VERBOSE  // Детальные логи (только при g_debugMode, не в ring buffer)
+    INFO,    // Important events (always visible)
+    DEBUG,   // Debug messages (only when g_debugMode is on)
+    VERBOSE  // Detailed logs (only when g_debugMode, not stored in ring buffer)
 };
 
 void btWebUI_init();

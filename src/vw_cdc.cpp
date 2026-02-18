@@ -2,7 +2,7 @@
 #include "bt_webui.h"
 #include <SPI.h>
 
-// Флаг debug режима (определён в bt_webui.cpp)
+// Debug mode flag (defined in bt_webui.cpp)
 extern bool g_debugMode;
 
 // ---------------- BCD Conversion ----------------
@@ -26,12 +26,12 @@ static int g_dataOutPin = -1;
 static CdcButtonCallback g_btnCb = nullptr;
 
 static CdcStatus g_status;
-static uint8_t g_modeByte = 0x00;  // Байт 5: SCAN/MIX (vwcdpic: 0x00=norm, 0x04=MIX, 0xD0=SCAN, 0xD4=both)
-static uint8_t g_scanByte = 0xCF;  // Байт 6: SCAN (0xCF=off, 0x4F=on ?)
+static uint8_t g_modeByte = 0x00;  // Byte 5: SCAN/MIX (vwcdpic: 0x00=norm, 0x04=MIX, 0xD0=SCAN, 0xD4=both)
+static uint8_t g_scanByte = 0xCF;  // Byte 6: SCAN (0xCF=off, 0x4F=on ?)
 static uint32_t g_prevMs = 0;
-static uint8_t g_playMinutes = 0;  // Начинаем с 00:00
-static uint8_t g_playSeconds = 0;  // Начинаем с 00:00
-static uint32_t g_lastBtTimeUpdate = 0;  // Когда последний раз получили время от BT
+static uint8_t g_playMinutes = 0;  // Start at 00:00
+static uint8_t g_playSeconds = 0;  // Start at 00:00
+static uint32_t g_lastBtTimeUpdate = 0;  // Last time we received a time update from BT
 static uint8_t g_discLoad = 0x2E;     // vwcdpic: StateInitPlay disc announce counter (0x2E=CD1)
 
 // ---------------- Logging Helpers ----------------
@@ -40,12 +40,12 @@ static void cdc_log(const String &s) {
 }
 
 static void cdc_log_nec(const String &s) {
-    // Шлем в отдельный канал для RAW терминала
+    // Send to separate channel for RAW terminal
     btWebUI_broadcastCdcRaw(String("[CDC_NEC] ") + s);
 }
 
-// ---------------- RAW PULSE SNIFFER (Кольцевой буфер) ----------------
-// Позволяет видеть "сырые" тайминги в логе, даже если декодер не узнал кнопку
+// ---------------- RAW PULSE SNIFFER (Ring buffer) ----------------
+// Shows raw pulse timings in the log, even if decoder didn't recognize a button
 #define RAW_BUF_SIZE 64
 static volatile uint16_t g_rawBuf[RAW_BUF_SIZE];
 static volatile uint8_t  g_rawHead = 0;
@@ -57,9 +57,10 @@ static void IRAM_ATTR log_raw_pulse(uint32_t dur) {
     g_rawHead = (g_rawHead + 1) % RAW_BUF_SIZE;
 }
 
-// Отправка накопленных RAW данных в WebUI (вызывается в loop)
+// Send accumulated RAW data to WebUI (called from loop)
 static void processRawLog() {
-    if (g_rawHead == g_rawTail) return; // Пусто
+    if (!g_debugMode) return;
+    if (g_rawHead == g_rawTail) return; // Empty
 
     String s = "RAW:";
     int count = 0;
@@ -68,13 +69,13 @@ static void processRawLog() {
         g_rawTail = (g_rawTail + 1) % RAW_BUF_SIZE;
         s += " " + String(d);
         count++;
-        if (count >= 20) {  // Увеличили до 20 чтобы видеть больше
+        if (count >= 20) {  // Increased to 20 to see more pulses
             cdc_log_nec(s);
             s = "RAW:";
             count = 0;
         }
     }
-    if (count > 0) cdc_log_nec(s);  // Отправим остаток
+    if (count > 0) cdc_log_nec(s);  // Send remaining data
 }
 
 // ---------------- VW CDC DataOut Decoder (vwcdpic protocol) ----------------
@@ -154,7 +155,7 @@ static void IRAM_ATTR vw_dataout_isr() {
             vw_capBitPacket = VW_PKTSIZE;  // Reset to 32 bits
             vw_capBit = 8;                 // Start fresh byte
             vw_currentByte = 0;
-            // NOTE: НЕ вызываем cdc_log_nec() здесь - String запрещён в ISR!
+            // NOTE: Don't call cdc_log_nec() here - String is forbidden in ISR!
             return; // Don't store start bit itself
         }
         
@@ -190,7 +191,7 @@ static void IRAM_ATTR vw_dataout_isr() {
         // Packet complete?
         if (vw_capBitPacket == 0) {
             vw_capBusy = false;
-            // NOTE: Логирование перенесено в cdc_pollNec() - String запрещён в ISR!
+            // NOTE: Logging moved to cdc_pollNec() - String is forbidden in ISR!
         }
     }
 }
@@ -231,65 +232,57 @@ static void vw_scanCommandBytes() {
         
         // Check byte3 + byte4 = 0xFF
         if ((uint8_t)(byte3 + byte4) != 0xFF) {
-            cdc_log_nec("VW: Invalid checksum: " + String(byte3, HEX) + " + " + String(byte4, HEX));
+            if (g_debugMode) {
+                cdc_log_nec("VW: Invalid checksum: " + String(byte3, HEX) + " + " + String(byte4, HEX));
+            }
             vw_scanPtr = (vw_scanPtr + 1) % VW_CAPBUFFER_SIZE;
             continue;
         }
         
         // Check byte3 is multiple of 4 (vwcdpic requirement)
         if ((byte3 & 0x03) != 0) {
-            cdc_log_nec("VW: cmdcode not multiple of 4: " + String(byte3, HEX));
+            if (g_debugMode) {
+                cdc_log_nec("VW: cmdcode not multiple of 4: " + String(byte3, HEX));
+            }
             vw_scanPtr = (vw_scanPtr + 1) % VW_CAPBUFFER_SIZE;
             continue;
         }
         
         // Valid packet found!
         uint8_t cmdcode = byte3;
-        // Логируем команды только в debug режиме
+        // Log commands only in debug mode
         if (g_debugMode) {
             cdc_log_nec("VW CMD: 0x" + String(cmdcode, HEX) + " (53 2C " + 
                         String(byte3, HEX) + " " + String(byte4, HEX) + ")");
         }
         
-        // Map to button - РЕАЛЬНЫЕ КОДЫ от RNS-MFD
+        // Map to button - actual codes from RNS-MFD
         CdcButton btn = CdcButton::UNKNOWN;
         switch (cmdcode) {
-            // Треки
+            // Track buttons
             case 0xF8: btn = CdcButton::NEXT_TRACK; break;
             case 0x78: btn = CdcButton::PREV_TRACK; break;
             
-            // CD кнопки (коды подтверждены RAW логами)
+            // CD buttons (codes confirmed via RAW logs)
             case 0x0C: btn = CdcButton::DISC_1; break;
             case 0x8C: btn = CdcButton::DISC_2; break;
             case 0x4C: btn = CdcButton::DISC_3; break;
             case 0xCC: btn = CdcButton::DISC_4; break;
-            case 0x2C: btn = CdcButton::DISC_5; break;  // Подтверждено
-            case 0xAC: btn = CdcButton::DISC_6; break;  // Подтверждено
+            case 0x2C: btn = CdcButton::DISC_5; break;  // Confirmed
+            case 0xAC: btn = CdcButton::DISC_6; break;  // Confirmed
             
-            // Функции
+            // Function buttons
             case 0xA0: btn = CdcButton::SCAN_TOGGLE; break;
             case 0xE0: btn = CdcButton::RANDOM_TOGGLE; break;
             
-            // Игнорируем служебные коды
-            case 0x14: break;  // Repeat-код (игнор)
-            case 0x38: break;  // CD confirm (игнор)
+            // Ignore service codes
+            case 0x14: break;  // Repeat code (ignore)
+            case 0x38: break;  // CD confirm (ignore)
         }
         
-        // Debounce: игнорируем повторы той же кнопки в течение 300мс
-        // cppcheck-suppress variableScope  ; static needed to persist across calls
-        static CdcButton lastBtn = CdcButton::UNKNOWN;
-        // cppcheck-suppress variableScope  ; static needed to persist across calls
-        static uint32_t lastBtnTime = 0;
-        uint32_t now = millis();
-        
+        // Just pass the button through, no debounce here. Logic handled in main.cpp
         if (g_btnCb && btn != CdcButton::UNKNOWN) {
-            if (btn != lastBtn || (now - lastBtnTime) > 300) {
-                lastBtn = btn;
-                lastBtnTime = now;
-                g_btnCb(btn);
-            } else if (g_debugMode) {
-                cdc_log("Button debounced: " + String((int)btn));
-            }
+            g_btnCb(btn);
         }
         
         // Advance scan pointer past this packet
@@ -298,7 +291,7 @@ static void vw_scanCommandBytes() {
 }
 
 static void cdc_pollNec() {
-    // Send raw logs
+    // Send raw logs (debug mode only)
     processRawLog();
 
     // Scan ring buffer for valid VW packets
@@ -311,28 +304,40 @@ static inline uint8_t fromBCD(uint8_t bcd) {
     return ((bcd >> 4) * 10) + (bcd & 0x0F);
 }
 
+static void cdc_sendSpiPacket(const uint8_t frame[8]) {
+    g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
+    for (int i = 0; i < 8; ++i) {
+        g_spi->transfer(frame[i]);
+        delayMicroseconds(874);
+    }
+    g_spi->endTransaction();
+}
+
+
 static void cdc_sendPackage(const uint8_t frame[8]) {
-    // Логируем ВСЕ отправляемые пакеты для диагностики
-    String hex = "SPI TX: ";
-    for(int i=0; i<8; i++) {
-        if (frame[i] < 0x10) hex += "0";
-        hex += String(frame[i], HEX) + " ";
+    if (g_debugMode) {
+        // Log sent packets only in debug mode to avoid excessive heap usage
+        String hex = "SPI TX: ";
+        for(int i=0; i<8; i++) {
+            if (frame[i] < 0x10) hex += "0";
+            hex += String(frame[i], HEX) + " ";
+        }
+
+        // Decode packet (track and time are in BCD format!)
+        uint8_t cmd = frame[0];
+        if (cmd == 0x34) {
+            uint8_t disc = 0xBF - frame[1];
+            uint8_t trackBCD = 0xFF - frame[2];
+            uint8_t minBCD = 0xFF - frame[3];
+            uint8_t secBCD = 0xFF - frame[4];
+            // Convert BCD back to decimal for readable log
+            hex += " PLAY CD" + String(disc) + " T" + String(fromBCD(trackBCD)) +
+                   " " + String(fromBCD(minBCD)) + ":" + String(fromBCD(secBCD));
+        } else if (cmd == 0x74) {
+            hex += " IDLE";
+        }
+        cdc_log(hex);
     }
-    
-    // Расшифровка пакета (track и время в BCD!)
-    uint8_t cmd = frame[0];
-    if (cmd == 0x34) {
-        uint8_t disc = 0xBF - frame[1];
-        uint8_t trackBCD = 0xFF - frame[2];
-        uint8_t minBCD = 0xFF - frame[3];
-        uint8_t secBCD = 0xFF - frame[4];
-        // Конвертируем BCD обратно в десятичные для читаемого лога
-        hex += "→ PLAY CD" + String(disc) + " T" + String(fromBCD(trackBCD)) + 
-               " " + String(fromBCD(minBCD)) + ":" + String(fromBCD(secBCD));
-    } else if (cmd == 0x74) {
-        hex += "→ IDLE";
-    }
-    cdc_log(hex);
     
     g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
     for (int i = 0; i < 8; ++i) {
@@ -352,10 +357,10 @@ void cdc_init(int sckPin, int misoPin, int mosiPin, int ssPin, int necPin, CdcBu
     cdc_log("SPI initialized: SCK=" + String(g_sckPin) + 
             " MISO=" + String(g_misoPin) + " MOSI=" + String(g_mosiPin));
 
-    // NEC decoder на отдельном пине (не MISO!)
+    // Button decoder on separate pin (not MISO!)
     g_dataOutPin = necPin;
     
-    // Инициализируем VW протокол
+    // Initialize VW protocol
     vw_capPtr = 0;
     vw_scanPtr = 0;
     vw_capBusy = false;
@@ -367,8 +372,8 @@ void cdc_init(int sckPin, int misoPin, int mosiPin, int ssPin, int necPin, CdcBu
     vw_isr_counter = 0;
     
     if (g_dataOutPin >= 0) {
-        // Внешняя схемотехника уже задаёт подтяжку, поэтому внутренний pull-up отключаем,
-        // иначе образуется делитель и уровень висит на ~1.5 В.
+        // External circuitry provides pull-up, so internal pull-up is disabled
+        // to avoid a voltage divider that would hold the level at ~1.5V.
         pinMode(g_dataOutPin, INPUT);
 
         // Test: Read initial pin state
@@ -379,10 +384,10 @@ void cdc_init(int sckPin, int misoPin, int mosiPin, int ssPin, int necPin, CdcBu
         cdc_log("VW DataOut ISR attached (CHANGE mode, with PULLUP)");
     }
     
-    // НЕ отправляем инициализацию здесь!
-    // Магнитола может быть еще не в режиме CDC.
-    // Вместо этого будем отправлять последовательность IDLE→LOAD→IDLE→PLAY в cdc_loop()
-    // Это активирует пункт CDC в меню магнитолы.
+    // Do NOT send init packets here!
+    // The radio may not be in CDC mode yet.
+    // Instead, we send the IDLE->LOAD->IDLE->PLAY sequence in cdc_loop().
+    // This activates the CDC menu item on the radio.
     cdc_log("=== CDC INIT: Will send init sequence (10s warmup) ===");
     g_prevMs = millis();
 }
@@ -406,16 +411,17 @@ void cdc_loop() {
                 " | CapPtr:" + String(vw_capPtr) + " ScanPtr:" + String(vw_scanPtr));
     }
     
-    processRawLog();
     cdc_pollNec();
     
     uint32_t now = millis();
     
-    // Инкремент времени каждую секунду (только если НЕ получаем от BT)
-    // Если BT присылает TRACKSTAT, используем его время, иначе считаем сами
+    // Increment time every second (only if NOT receiving from BT)
+    // If BT sends TRACKSTAT, use its time; otherwise count locally
     static uint32_t lastSecond = 0;
-    bool btTimeActive = (g_lastBtTimeUpdate > 0) && ((now - g_lastBtTimeUpdate) < 3000);
+    // bool btTimeActive = (g_lastBtTimeUpdate > 0) && ((now - g_lastBtTimeUpdate) < 3000);
     
+    // Disable internal time counting - rely ONLY on Bluetooth time
+    /*
     if (!btTimeActive && state == ST_PLAY && g_status.state == CdcPlayState::PLAYING && (now - lastSecond >= 1000)) {
         lastSecond = now;
         g_playSeconds++;
@@ -425,6 +431,7 @@ void cdc_loop() {
             if (g_playMinutes >= 100) g_playMinutes = 0;
         }
     }
+    */
     
     if (now - g_prevMs >= 50) {  // 50ms = 20 packets/sec (vwcdpic timing)
         g_prevMs = now;
@@ -459,12 +466,7 @@ void cdc_loop() {
                 cdc_log(hex);
             }
             
-            g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-            for (int i = 0; i < 8; ++i) {
-                g_spi->transfer(idle[i]);
-                delayMicroseconds(874);
-            }
-            g_spi->endTransaction();
+            cdc_sendSpiPacket(idle);
             
             stateCounter++;
             if (stateCounter >= 0) {  // incfsz BIDIcount, f → goto StateIdle (then call SetStateInitPlay)
@@ -505,12 +507,7 @@ void cdc_loop() {
                     cdc_log(hex);
                 }
                 
-                g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-                for (int i = 0; i < 8; ++i) {
-                    g_spi->transfer(frame[i]);
-                    delayMicroseconds(874);
-                }
-                g_spi->endTransaction();
+                cdc_sendSpiPacket(frame);
                 
                 // Cycle discload: 0x29 → reached CD6? → 0x2E : decf discload
                 if (g_discLoad == 0x29) {
@@ -539,12 +536,7 @@ void cdc_loop() {
                     cdc_log(hex);
                 }
                 
-                g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-                for (int i = 0; i < 8; ++i) {
-                    g_spi->transfer(frame[i]);
-                    delayMicroseconds(874);
-                }
-                g_spi->endTransaction();
+                cdc_sendSpiPacket(frame);
             }
             
             stateCounter++;
@@ -574,12 +566,7 @@ void cdc_loop() {
                     0x3C
                 };
                 
-                g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-                for (int i = 0; i < 8; ++i) {
-                    g_spi->transfer(frame[i]);
-                    delayMicroseconds(874);
-                }
-                g_spi->endTransaction();
+                cdc_sendSpiPacket(frame);
             }
             else {
                 // Normal: 34 BE FE FF FF FF AE 3C
@@ -592,12 +579,7 @@ void cdc_loop() {
                     0x3C
                 };
                 
-                g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-                for (int i = 0; i < 8; ++i) {
-                    g_spi->transfer(frame[i]);
-                    delayMicroseconds(874);
-                }
-                g_spi->endTransaction();
+                cdc_sendSpiPacket(frame);
             }
             
             stateCounter++;
@@ -611,7 +593,7 @@ void cdc_loop() {
         // ====== STATE: Play (vwcdpic lines 2329-2340) ======
         else if (state == ST_PLAY) {
             // StatePlay: 34 BE FE MM SS FB CF 3C (continuous)
-            // Track и время в BCD формате!
+            // Track and time in BCD format!
             uint8_t trackBCD = toBCD(track);
             uint8_t minBCD = toBCD(g_playMinutes);
             uint8_t secBCD = toBCD(g_playSeconds);
@@ -622,12 +604,12 @@ void cdc_loop() {
                 (uint8_t)(0xFF - trackBCD),
                 (uint8_t)(0xFF - minBCD),
                 (uint8_t)(0xFF - secBCD),
-                g_modeByte,  // Байт 5: MIX (0xFF=off, 0x55=on)
-                g_scanByte,  // Байт 6: SCAN (0xCF=off, 0x4F=on)
+                g_modeByte,  // Byte 5: MIX (0xFF=off, 0x55=on)
+                g_scanByte,  // Byte 6: SCAN (0xCF=off, 0x4F=on)
                 0x3C
             };
             
-            // Логируем [PLAY] только в debug режиме
+            // Log [PLAY] only in debug mode
             if (g_debugMode) {
                 static int playCount = 0;
                 playCount++;
@@ -638,7 +620,7 @@ void cdc_loop() {
                         hex += String(frame[i], HEX) + " ";
                     }
                     hex += "→ CD" + String(disc) + " T" + String(track) + " ";
-                    // Время всегда показываем (начинаем с 00:00)
+                    // Always show time (starting from 00:00)
                     if (g_playMinutes < 10) hex += "0";
                     hex += String(g_playMinutes) + ":";
                     if (g_playSeconds < 10) hex += "0";
@@ -647,12 +629,7 @@ void cdc_loop() {
                 }
             }
             
-            g_spi->beginTransaction(SPISettings(62500, MSBFIRST, SPI_MODE1));
-            for (int i = 0; i < 8; ++i) {
-                g_spi->transfer(frame[i]);
-                delayMicroseconds(874);
-            }
-            g_spi->endTransaction();
+            cdc_sendSpiPacket(frame);
         }
     }
 }
@@ -661,13 +638,19 @@ void cdc_loop() {
 void cdc_setDiscTrack(uint8_t d, uint8_t t) { 
     g_status.disc=d; 
     g_status.track=t; 
-    g_playMinutes = 0;  // Сброс времени на 00:00 при смене трека
+    // Do NOT reset time blindly, allow caller (main.cpp) to manage it
+    // g_playMinutes = 0; 
+    // g_playSeconds = 0;
+    
+    // Reset time only if track changed and we don't have a valid BT time yet
+    // Actually, best to just reset to 0 and let BT update it
+    g_playMinutes = 0;
     g_playSeconds = 0;
 }
 void cdc_setPlayState(CdcPlayState s) { g_status.state=s; }
 
-// Таблица из vwcdpic (без инверсий!):
-// 0x00 = scan off, mix off (норма)
+// Mode byte table from vwcdpic (without inversions!):
+// 0x00 = scan off, mix off (normal)
 // 0x04 = scan off, mix on
 // 0xD0 = scan on, mix off
 // 0xD4 = scan on, mix on
@@ -684,7 +667,7 @@ static void updateModeBytes() {
         g_modeByte = 0x00;
     }
     
-    // Байт 6: НЕ трогаем! Всегда 0xCF
+    // Byte 6: Don't touch! Always 0xCF
     g_scanByte = 0xCF;
     
     if (oldMode != g_modeByte) {
@@ -704,7 +687,7 @@ void cdc_setPlayTime(uint8_t minutes, uint8_t seconds) {
     if (seconds > 59) seconds = 59;
     g_playMinutes = minutes;
     g_playSeconds = seconds;
-    g_lastBtTimeUpdate = millis();  // Отмечаем что получили время от BT
+    g_lastBtTimeUpdate = millis();  // Mark that we received time from BT
 }
 
 void cdc_setRandom(bool o) { 
@@ -717,3 +700,15 @@ void cdc_setScan(bool o) {
     updateModeBytes(); 
 }
 CdcStatus cdc_getStatus() { return g_status; }
+
+void cdc_pause(bool pause) {
+    if (g_dataOutPin < 0) return;
+
+    if (pause) {
+        detachInterrupt(digitalPinToInterrupt(g_dataOutPin));
+        cdc_log("VW DataOut ISR detached for OTA");
+    } else {
+        attachInterrupt(digitalPinToInterrupt(g_dataOutPin), vw_dataout_isr, CHANGE);
+        cdc_log("VW DataOut ISR re-attached after OTA");
+    }
+}

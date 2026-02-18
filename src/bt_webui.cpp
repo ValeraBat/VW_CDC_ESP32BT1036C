@@ -4,6 +4,9 @@
 #include <ElegantOTA.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+#include <esp_task_wdt.h>
+#include "vw_cdc.h"
+#include "bt1036_at.h"
 
 // ========== Debug mode ==========
 bool g_debugMode = false;
@@ -13,7 +16,7 @@ void btWebUI_setDebug(bool on) {
     btWebUI_log(String("[SYS] Debug mode: ") + (on ? "ON" : "OFF"));
 }
 
-// ========== Параметры точки доступа (AP) ==========
+// ========== Access Point (AP) Configuration ==========
 static String apSsid = "VW-BT1036";
 static String apPsk  = "12345678";
 static const char* hostname = "vw-bt";
@@ -38,7 +41,6 @@ void btWebUI_log(const String &line, LogLevel level) {
     if ((level == LogLevel::DEBUG || level == LogLevel::VERBOSE) && !g_debugMode) {
         return;
     }
-    Serial.println(line);
     if (level != LogLevel::VERBOSE) {
         logAppend(line);
     }
@@ -77,7 +79,7 @@ static void onWsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t leng
 
 // 1. MAIN PAGE
 static const char MAIN_PAGE[] PROGMEM = R"rawliteral(
-<!doctype html><html><head><meta charset="utf-8"><title>VW BT1036</title>
+<!doctype html><html><head><meta charset="utf-8"><title>VW BT1036 {VERSION}</title>
 <style>
 body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:5px}
 nav{margin-bottom:10px;padding:5px;background:#222;border-bottom:1px solid #444}
@@ -104,12 +106,14 @@ small{color:#888}
   <a href="/wifi">WiFi</a>
   <a href="/update" style="color:#fa0">OTA</a>
 </nav>
+<div style="font-size:12px;color:#555;float:right;margin-top:-30px;margin-right:10px;">{VERSION}</div>
 <div id="ip_info" style="color:#aaa;font-size:0.8em;margin-bottom:5px;"></div>
 <section>
   <h3 style="margin:0 0 10px 0">BT1036 Status</h3>
   <div style="display:flex;gap:20px;margin-bottom:10px;">
     <div>State: <span id="st_state" class="status-val">-</span></div>
     <div>Power: <span id="st_power" class="status-val">-</span></div>
+    <div>Device: <span id="st_device" class="status-val">-</span></div>
   </div>
   <div>
     <button onclick="sendCmd('scan')">Scan</button>
@@ -155,6 +159,7 @@ small{color:#888}
       <div><label>Mic Gain:</label><input id="micgain" type="number" value="8"></div>
       <div><label>A2DP Vol:</label><input id="a2dpvol" type="number" value="12"></div>
       <div><label>HFP Vol:</label><input id="hfpvol" type="number" value="12"></div>
+      <div><label>TX Power:</label><input id="txpower" type="number" value="10"></div>
       <button onclick="sendAudio()" style="margin-top:5px;">Apply</button>
     </div>
   </details>
@@ -168,12 +173,93 @@ small{color:#888}
     </div>
   </details>
 </section>
+<section>
+  <details open><summary>Paired Devices</summary>
+    <div style="padding-top:5px;">
+      <button onclick="updatePairedList()">Refresh List</button>
+      <div id="paired_list" style="margin-top:10px;"></div>
+    </div>
+  </details>
+</section>
 <script>
 function updateStatus(){fetch('/api/status').then(function(r){return r.json();}).then(function(st){
   document.getElementById('st_state').textContent=st.state;
   document.getElementById('st_power').textContent=st.devstat.powerOn?'ON':'OFF';
+  if (st.connected && (st.connected.name || st.connected.mac)) {
+    document.getElementById('st_device').textContent=st.connected.name || st.connected.mac;
+  } else {
+    document.getElementById('st_device').textContent='-';
+  }
 });}
 setInterval(updateStatus,2000);updateStatus();
+
+function updatePairedList(){
+  updatePairedListEx(true);
+}
+
+var pairedPollTimer = 0;
+function updatePairedListEx(forceRefresh){
+  if (pairedPollTimer) { clearTimeout(pairedPollTimer); pairedPollTimer = 0; }
+
+  var url = '/api/bt_devices';
+  if (forceRefresh) url += '?refresh=1';
+
+  fetch(url).then(function(r){return r.json();}).then(function(data){
+    var listDiv = document.getElementById('paired_list');
+    listDiv.innerHTML = '';
+
+    // If module is still sending +PLIST lines, keep polling;
+    // we can already show what has been parsed so far.
+    if (data.pending) {
+      var hint = document.createElement('div');
+      hint.style.color = '#fa0';
+      hint.style.marginBottom = '6px';
+      hint.textContent = 'Updating...';
+      listDiv.appendChild(hint);
+      pairedPollTimer = setTimeout(function(){ updatePairedListEx(false); }, 300);
+    }
+
+    if (data.devices && data.devices.length > 0) {
+      var connectedMac = data.connected_mac;
+      for (var i=0; i<data.devices.length; i++) {
+        var dev = data.devices[i];
+        var isConnected = (dev.mac === connectedMac);
+        var item = document.createElement('div');
+        item.style.padding = '4px';
+        item.style.borderBottom = '1px solid #333';
+        if (isConnected) item.style.background = '#030';
+
+        var strong = document.createElement('strong');
+        strong.textContent = dev.name || '';
+
+        var nameHtml = strong.outerHTML;
+        var connHtml = isConnected ? ' <span style="color:#0f0;">(Connected)</span>' : '';
+        var mac = dev.mac || '';
+
+        item.innerHTML = nameHtml + ' <small>(' + mac + ')</small>' + connHtml +
+          '<button onclick="deleteDevice(\'' + mac + '\')" style="float:right;background:#800;font-size:12px;padding:2px 6px;">Delete</button>';
+
+        listDiv.appendChild(item);
+      }
+    } else {
+      if (!data.pending) {
+        listDiv.innerHTML = 'No paired devices found.';
+      }
+    }
+  }).catch(function(){
+    document.getElementById('paired_list').innerHTML = 'Error loading device list.';
+  });
+}
+
+function deleteDevice(mac) {
+  if (confirm('Are you sure you want to delete device ' + mac + '?')) {
+    fetch('/api/bt_delete?mac=' + mac).then(function(){
+      setTimeout(function(){ updatePairedListEx(true); }, 500); // Refresh after delete
+    });
+  }
+}
+document.addEventListener('DOMContentLoaded', function(){ updatePairedListEx(true); });
+
 function sendCmd(a){fetch('/api/cmd?act='+a);}
 function sendBasic(){
   var n=encodeURIComponent(document.getElementById('name').value);
@@ -197,7 +283,8 @@ function sendHfp(){
 }
 function sendAudio(){
   var m=document.getElementById('micgain').value,a=document.getElementById('a2dpvol').value,h=document.getElementById('hfpvol').value;
-  fetch('/api/audio?mg='+m+'&a2='+a+'&hf='+h+'&tx=10');
+  var tx=document.getElementById('txpower').value;
+  fetch('/api/audio?mg='+m+'&a2='+a+'&hf='+h+'&tx='+tx);
 }
 function sendReboot(t){fetch('/api/reboot?target='+t);}
 function sendFactory(){fetch('/api/factory');}
@@ -317,6 +404,11 @@ button{margin:2px;padding:6px 12px;background:#333;color:#fff;border:1px solid #
   <div class="log-box" id="log_bt" style="height:50vh;"></div>
 </section>
 <section>
+  <h3>Manual AT Command</h3>
+  <input type="text" id="at_cmd" placeholder="e.g., AT+VER" style="width: 200px;">
+  <button onclick="sendAt()" style="background:#036;">Send</button>
+</section>
+<section>
   <button onclick="toggleDebug()" id="debugBtn" style="background:#333;">Debug Mode: OFF</button>
 </section>
 <script>
@@ -330,6 +422,10 @@ ws.onmessage=function(ev){
     if(!paused)b.scrollTop=99999;
   }
 };
+function sendAt(){
+  var cmd=document.getElementById('at_cmd').value;
+  if(cmd){fetch('/api/at_cmd?cmd='+encodeURIComponent(cmd));}
+}
 function clr(){document.getElementById('log_bt').innerHTML="";}
 function togglePause(){
   paused=!paused;
@@ -576,15 +672,23 @@ fetch('/api/debug_status').then(function(r){return r.text();}).then(function(t){
 </body></html>
 )rawliteral";
 
+// ========== Firmware Version ==========
+// defined in main.cpp, used here via extern
+extern const char* FW_VERSION;
+
 // ======================= API HANDLERS =======================
 
 static void handleRoot() { 
     String p = MAIN_PAGE;
-    String ips = "AP: " + WiFi.softAPIP().toString();
-    if (WiFi.status() == WL_CONNECTED) {
-        ips += " | Home: " + WiFi.localIP().toString() + " (" + WiFi.SSID() + ")";
-        ips += " | <a href='http://" + String(hostname) + ".local' style='color:#0f0'>http://" + String(hostname) + ".local</a>";
-    }
+    p.replace("{VERSION}", FW_VERSION);
+    
+  String apIp = WiFi.softAPIP().toString();
+  String ips = "AP: <a href='http://" + apIp + "' style='color:#0f0'>http://" + apIp + "</a>";
+  ips += " | mDNS: <a href='http://" + String(hostname) + ".local' style='color:#0f0'>http://" + String(hostname) + ".local</a>";
+  ips += " | <a href='/update' style='color:#fa0'>OTA</a>";
+  if (WiFi.status() == WL_CONNECTED) {
+    ips += " | Home: " + WiFi.localIP().toString() + " (" + WiFi.SSID() + ")";
+  }
     p.replace("<div id=\"ip_info\" style=\"color:#aaa;font-size:0.8em;margin-bottom:5px;\"></div>", 
               "<div id=\"ip_info\" style=\"color:#aaa;margin-bottom:5px;\">" + ips + "</div>");
     webServer.send(200, "text/html", p); 
@@ -594,12 +698,78 @@ static void handleBtPage() { webServer.send_P(200, "text/html", BT_PAGE); }
 static void handleCdc() { webServer.send_P(200, "text/html", CDC_PAGE); }
 static void handleLogs() { webServer.send_P(200, "text/html", LOGS_PAGE); }
 
+static void handleBtDevices() {
+  // Optional refresh trigger. Parsing is async, so UI should poll while pending=true.
+  bool refresh = (webServer.arg("refresh") == "1");
+  if (refresh) {
+    bt1036_requestPairedList();
+  }
+
+    const auto& devices = bt1036_getPairedList();
+    String connectedMac = bt1036_getConnectedMac();
+  bool pending = bt1036_isPairedListPending();
+
+  // Basic JSON escaping
+  connectedMac.replace("\\", "\\\\");
+  connectedMac.replace("\"", "\\\"");
+
+  String json = "{";
+  json += "\"pending\":" + String(pending ? "true" : "false") + ",";
+  json += "\"connected_mac\":\"" + connectedMac + "\",";
+  json += "\"devices\":[";
+    bool first = true;
+    for (const auto& dev : devices) {
+        if (!first) {
+            json += ",";
+        }
+        // Basic JSON escaping for name
+        String devName = dev.name;
+        devName.replace("\\", "\\\\");
+        devName.replace("\"", "\\\"");
+
+        json += "{";
+        String devMac = dev.mac;
+        devMac.replace("\\", "\\\\");
+        devMac.replace("\"", "\\\"");
+
+        json += "\"mac\":\"" + devMac + "\",";
+        json += "\"name\":\"" + devName + "\",";
+        json += "\"index\":" + String(dev.index);
+        json += "}";
+        first = false;
+    }
+      json += "]";
+      json += "}";
+    webServer.send(200, "application/json", json);
+}
+
+static void handleBtDelete() {
+    String mac = webServer.arg("mac");
+    if (mac.length() > 0) {
+        btWebUI_log("[WEB] Deleting device: " + mac);
+        bt1036_deleteDevice(mac);
+        webServer.send(200, "text/plain", "OK");
+    } else {
+        webServer.send(400, "text/plain", "Bad MAC address");
+    }
+}
+
 static void handleStatus() {
     BTConnState st = bt1036_getState();
     BtDevStat   ds = bt1036_getDevStat();
+  String cmac = bt1036_getConnectedMac();
+  String cname = bt1036_getConnectedName();
+
+  // Basic JSON escaping
+  cmac.replace("\\", "\\\\");
+  cmac.replace("\"", "\\\"");
+  cname.replace("\\", "\\\\");
+  cname.replace("\"", "\\\"");
+
     String json = "{";
     json += "\"state\":\"" + String(stateToStr(st)) + "\",";
     json += "\"devstat\":{\"powerOn\":" + String(ds.powerOn ? "true":"false") + "}";
+  json += ",\"connected\":{\"mac\":\"" + cmac + "\",\"name\":\"" + cname + "\"}";
     json += "}";
     webServer.send(200, "application/json", json);
 }
@@ -704,6 +874,8 @@ void btWebUI_init() {
     webServer.on("/logs", handleLogs);
     
     // API Routes
+    webServer.on("/api/bt_devices", handleBtDevices);
+    webServer.on("/api/bt_delete", handleBtDelete);
     webServer.on("/api/status", handleStatus);
     webServer.on("/api/cmd", handleCmd);
     webServer.on("/api/audio", handleAudio);
@@ -740,6 +912,36 @@ void btWebUI_init() {
     
     webServer.on("/api/debug_status", []() {
         webServer.send(200, "text/plain", g_debugMode ? "ON" : "OFF");
+    });
+
+    webServer.on("/api/at_cmd", []() {
+        String cmd = webServer.arg("cmd");
+        if (cmd.length() > 0) {
+            btWebUI_log("[WEB] Manual command: " + cmd, LogLevel::INFO);
+            bt1036_sendRawCommand(cmd);
+            webServer.send(200, "text/plain", "OK");
+        } else {
+            webServer.send(400, "text/plain", "Bad Command");
+        }
+    });
+
+    // Configure OTA callbacks for safe updates
+    ElegantOTA.onStart([]() {
+        btWebUI_log("[OTA] Update started. Pausing peripherals.");
+        esp_task_wdt_delete(NULL);  // Disable WDT for the loop task during OTA
+        bt1036_pausePolling(true);
+        cdc_pause(true);
+    });
+    ElegantOTA.onEnd([](bool success) {
+        if (success) {
+            btWebUI_log("[OTA] Update successful! Rebooting...");
+            delay(500);
+            ESP.restart();
+        } else {
+            btWebUI_log("[OTA] Update failed! Resuming normal operation.");
+            bt1036_pausePolling(false);
+            cdc_pause(false);
+        }
     });
 
     ElegantOTA.begin(&webServer);
